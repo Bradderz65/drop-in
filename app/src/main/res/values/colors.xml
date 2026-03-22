@@ -1,0 +1,9 @@
+<resources>
+    <color name="dropin_bg">#06131F</color>
+    <color name="dropin_panel">#102336</color>
+    <color name="dropin_panel_alt">#18324A</color>
+    <color name="dropin_accent">#39D98A</color>
+    <color name="dropin_danger">#FF6B6B</color>
+    <color name="dropin_text">#F5F7FA</color>
+    <color name="dropin_muted">#91A3B7</color>
+</resources>
