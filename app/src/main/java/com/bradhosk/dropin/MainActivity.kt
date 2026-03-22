@@ -81,6 +81,7 @@ class MainActivity : ComponentActivity() {
                     onToggleSpeaker = viewModel::setSpeakerEnabled,
                     onSwitchCamera = viewModel::switchCamera,
                     onSwapViews = viewModel::swapVideoViews,
+                    onSaveTailnetHost = viewModel::setSavedTailnetHost,
                     onToggleFullscreen = ::applyFullscreen,
                     onHangUp = viewModel::hangUp,
                     localVideo = { modifier -> VideoRenderer("local", modifier) { renderer -> onLocalRendererCreated(renderer) } },

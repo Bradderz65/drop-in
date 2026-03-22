@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -40,8 +39,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -74,6 +73,7 @@ fun DropInScreen(
     onToggleSpeaker: (Boolean) -> Unit,
     onSwitchCamera: () -> Unit,
     onSwapViews: () -> Unit,
+    onSaveTailnetHost: (String) -> Unit,
     onToggleFullscreen: (Boolean) -> Unit,
     onHangUp: () -> Unit,
     localVideo: @Composable (Modifier) -> Unit,
@@ -81,6 +81,11 @@ fun DropInScreen(
 ) {
     var areControlsVisible by rememberSaveable(state.isInCall) { mutableStateOf(true) }
     var controlsInteractionCount by remember { mutableIntStateOf(0) }
+    var tailnetHostDraft by rememberSaveable { mutableStateOf(state.savedTailnetHost) }
+
+    LaunchedEffect(state.savedTailnetHost) {
+        tailnetHostDraft = state.savedTailnetHost
+    }
 
     fun revealControls() {
         areControlsVisible = true
@@ -131,11 +136,19 @@ fun DropInScreen(
             }
 
             Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .clip(if (isFullscreen) RoundedCornerShape(0.dp) else RoundedCornerShape(28.dp))
-                    .background(Color(0xFF13293D)),
+                modifier = if (isFullscreen) {
+                    Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .clip(RoundedCornerShape(0.dp))
+                        .background(Color(0xFF13293D))
+                } else {
+                    Modifier
+                        .fillMaxWidth()
+                        .height(320.dp)
+                        .clip(RoundedCornerShape(28.dp))
+                        .background(Color(0xFF13293D))
+                },
             ) {
                 val fullScreenModifier = Modifier
                     .matchParentSize()
@@ -147,8 +160,28 @@ fun DropInScreen(
                     .clip(RoundedCornerShape(24.dp))
                     .background(Color(0xFF0F1E2A))
                     .zIndex(1f)
-                val remoteModifier = if (state.isRemotePrimary) fullScreenModifier else pipModifier
-                val localModifier = if (state.isRemotePrimary) pipModifier else fullScreenModifier
+                val hiddenModifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(1.dp)
+                    .size(1.dp)
+                    .zIndex(-1f)
+                val remoteShouldBePrimary = if (isFullscreen) {
+                    state.hasRemoteVideo
+                } else {
+                    state.isRemotePrimary
+                }
+                val remoteModifier = when {
+                    isFullscreen && remoteShouldBePrimary -> fullScreenModifier
+                    isFullscreen -> hiddenModifier
+                    remoteShouldBePrimary -> fullScreenModifier
+                    else -> pipModifier
+                }
+                val localModifier = when {
+                    isFullscreen && remoteShouldBePrimary -> hiddenModifier
+                    isFullscreen -> fullScreenModifier
+                    remoteShouldBePrimary -> pipModifier
+                    else -> fullScreenModifier
+                }
 
                 remoteVideo(remoteModifier)
                 localVideo(localModifier)
@@ -273,19 +306,64 @@ fun DropInScreen(
 
             if (!isFullscreen) {
                 Spacer(modifier = Modifier.height(16.dp))
-                Text(
-                    text = "Available on your local network",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = Color.White,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-
                 LazyColumn(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
                     contentPadding = PaddingValues(bottom = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
+                    item {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color(0xCC18324A)),
+                            shape = RoundedCornerShape(24.dp),
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(18.dp),
+                                verticalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                Text(
+                                    text = "Saved Tailscale Peer",
+                                    color = Color.White,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                                Text(
+                                    text = "Save one Tailscale IP or hostname and it will appear in the peer list for quick connect.",
+                                    color = Color(0xFF91A3B7),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                OutlinedTextField(
+                                    value = tailnetHostDraft,
+                                    onValueChange = { tailnetHostDraft = it },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    label = { Text("Tailscale host or IP") },
+                                    placeholder = { Text("100.x.y.z or machine-name") },
+                                    singleLine = true,
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Button(onClick = { onSaveTailnetHost(tailnetHostDraft) }) {
+                                        Text("Save")
+                                    }
+                                    Button(onClick = {
+                                        tailnetHostDraft = ""
+                                        onSaveTailnetHost("")
+                                    }) {
+                                        Text("Disable")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    item {
+                        Text(
+                            text = "Available peers",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = Color.White,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
                     items(state.devices, key = { it.serviceName }) { peer ->
                         PeerCard(peer = peer, onConnect = { onConnect(peer) })
                     }

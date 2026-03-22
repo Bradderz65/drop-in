@@ -26,6 +26,7 @@ import org.webrtc.SessionDescription
 data class DropInUiState(
     val deviceName: String,
     val devices: List<PeerDevice> = emptyList(),
+    val savedTailnetHost: String = "",
     val selectedPeer: PeerDevice? = null,
     val isInCall: Boolean = false,
     val isMicOn: Boolean = true,
@@ -33,6 +34,7 @@ data class DropInUiState(
     val isSpeakerOn: Boolean = true,
     val isUsingFrontCamera: Boolean = true,
     val isRemotePrimary: Boolean = true,
+    val hasRemoteVideo: Boolean = false,
     val status: String = "Searching for local devices",
 )
 
@@ -59,6 +61,9 @@ class DropInViewModel(
 
     init {
         runtime.start()
+        dropInManager.onRemoteVideoReady = {
+            _uiState.value = _uiState.value.copy(hasRemoteVideo = true)
+        }
         dropInManager.onIceCandidateDiscovered = { candidate ->
             _uiState.value.selectedPeer?.let { peer ->
                 signalingClient.send(candidate.toSignalEnvelope(peer.serviceName))
@@ -69,6 +74,12 @@ class DropInViewModel(
         viewModelScope.launch {
             runtime.peers.collect { devices ->
                 _uiState.value = _uiState.value.copy(devices = devices)
+            }
+        }
+
+        viewModelScope.launch {
+            runtime.savedTailnetHost.collect { host ->
+                _uiState.value = _uiState.value.copy(savedTailnetHost = host)
             }
         }
 
@@ -104,6 +115,7 @@ class DropInViewModel(
         signalingClient.disconnect()
         _uiState.value = _uiState.value.copy(
             selectedPeer = peer,
+            hasRemoteVideo = false,
             status = "Connecting to ${peer.displayName}",
         )
         dropInManager.createPeerConnection {
@@ -147,6 +159,7 @@ class DropInViewModel(
             selectedPeer = null,
             isInCall = false,
             isSpeakerOn = true,
+            hasRemoteVideo = false,
             status = "Ready for drop in",
         )
     }
@@ -172,6 +185,14 @@ class DropInViewModel(
         }
     }
 
+    fun setSavedTailnetHost(host: String) {
+        runtime.updateSavedTailnetHost(host)
+        _uiState.value = _uiState.value.copy(
+            savedTailnetHost = host.trim(),
+            status = if (host.isBlank()) "Saved Tailscale peer cleared" else "Saved Tailscale peer updated",
+        )
+    }
+
     fun swapVideoViews() {
         val remotePrimary = !_uiState.value.isRemotePrimary
         dropInManager.setRemotePrimary(remotePrimary)
@@ -191,6 +212,7 @@ class DropInViewModel(
                 _uiState.value = _uiState.value.copy(
                     isInCall = false,
                     isSpeakerOn = true,
+                    hasRemoteVideo = false,
                     selectedPeer = null,
                     status = "Call ended",
                 )
@@ -208,7 +230,11 @@ class DropInViewModel(
             Log.w(logTag, "handleOffer using fallback peer serviceName=${signal.from}; knownPeers=${peers.value.map { known -> known.serviceName }}")
         }
         Log.d(logTag, "handleOffer peer=${peer.displayName}")
-        _uiState.value = _uiState.value.copy(selectedPeer = peer, status = "Incoming drop in from ${peer.displayName}")
+        _uiState.value = _uiState.value.copy(
+            selectedPeer = peer,
+            hasRemoteVideo = false,
+            status = "Incoming drop in from ${peer.displayName}",
+        )
 
         dropInManager.endCall()
         dropInManager.createPeerConnection {
@@ -237,7 +263,11 @@ class DropInViewModel(
         connectTimeoutJob?.cancel()
         val description = SessionDescription(SessionDescription.Type.ANSWER, signal.sdp.orEmpty())
         dropInManager.setRemoteDescription(description)
-        _uiState.value = _uiState.value.copy(isInCall = true, status = "Call established")
+        _uiState.value = _uiState.value.copy(
+            isInCall = true,
+            hasRemoteVideo = false,
+            status = "Call established",
+        )
     }
 
     private fun handleIce(signal: SignalEnvelope) {
@@ -273,6 +303,7 @@ class DropInViewModel(
                     dropInManager.endCall()
                     _uiState.value = _uiState.value.copy(
                         selectedPeer = null,
+                        hasRemoteVideo = false,
                         status = "Signaling failed: ${status.message}",
                     )
                 }

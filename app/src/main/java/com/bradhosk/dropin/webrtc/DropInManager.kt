@@ -41,6 +41,8 @@ class DropInManager(
     private var localAudioTrack: AudioTrack? = null
     private var remoteRenderer: SurfaceViewRenderer? = null
     private var localRenderer: SurfaceViewRenderer? = null
+    private var initializedRemoteRenderer: SurfaceViewRenderer? = null
+    private var initializedLocalRenderer: SurfaceViewRenderer? = null
     private var remoteVideoTrack: VideoTrack? = null
     private var isUsingFrontCamera = true
     private var previousAudioMode: Int = audioManager.mode
@@ -65,16 +67,19 @@ class DropInManager(
 
     fun initializeRenderers(local: SurfaceViewRenderer, remote: SurfaceViewRenderer) {
         if (localRenderer === local && remoteRenderer === remote) return
+        if (localRenderer !== local) {
+            localVideoTrack?.removeSink(localRenderer)
+        }
+        if (remoteRenderer !== remote) {
+            remoteVideoTrack?.removeSink(remoteRenderer)
+        }
         localRenderer = local
         remoteRenderer = remote
 
-        listOf(local to RendererCommon.ScalingType.SCALE_ASPECT_FILL, remote to RendererCommon.ScalingType.SCALE_ASPECT_FIT)
-            .forEach { (renderer, scaling) ->
-                renderer.init(eglBase.eglBaseContext, null)
-                renderer.setScalingType(scaling)
-                renderer.setMirror(renderer === local && isUsingFrontCamera)
-                renderer.setEnableHardwareScaler(true)
-            }
+        initializeRendererIfNeeded(local, isLocal = true, scaling = RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+        initializeRendererIfNeeded(remote, isLocal = false, scaling = RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+        localVideoTrack?.addSink(local)
+        remoteVideoTrack?.addSink(remote)
         setRemotePrimary(true)
     }
 
@@ -219,6 +224,8 @@ class DropInManager(
         stopLocalMedia()
         localRenderer?.release()
         remoteRenderer?.release()
+        initializedLocalRenderer = null
+        initializedRemoteRenderer = null
         localRenderer = null
         remoteRenderer = null
         eglBase.release()
@@ -239,6 +246,29 @@ class DropInManager(
         remoteVideoTrack = track
         track.addSink(remoteRenderer)
         onRemoteVideoReady()
+    }
+
+    private fun initializeRendererIfNeeded(
+        renderer: SurfaceViewRenderer,
+        isLocal: Boolean,
+        scaling: RendererCommon.ScalingType,
+    ) {
+        val alreadyInitialized = if (isLocal) {
+            initializedLocalRenderer === renderer
+        } else {
+            initializedRemoteRenderer === renderer
+        }
+        if (!alreadyInitialized) {
+            renderer.init(eglBase.eglBaseContext, null)
+            if (isLocal) {
+                initializedLocalRenderer = renderer
+            } else {
+                initializedRemoteRenderer = renderer
+            }
+        }
+        renderer.setScalingType(scaling)
+        renderer.setMirror(isLocal && isUsingFrontCamera)
+        renderer.setEnableHardwareScaler(true)
     }
 
     private fun configureAudioRoute(useSpeaker: Boolean) {

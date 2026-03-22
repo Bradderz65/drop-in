@@ -19,6 +19,7 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 LOG = logging.getLogger("dropin-server")
 SERVICE_TYPE = "_dropin._tcp.local."
+REGISTRY_TTL_SECONDS = 45
 UI_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -202,12 +203,47 @@ class TestPatternVideoTrack(VideoStreamTrack):
         return frame
 
 
+class TailnetRegistry:
+    def __init__(self) -> None:
+        self._records: dict[str, dict] = {}
+
+    def register(self, service_name: str, display_name: str, host: str, port: int, persistent: bool = False) -> None:
+        self._records[service_name] = {
+            "service_name": service_name,
+            "display_name": display_name,
+            "host": host,
+            "port": port,
+            "persistent": persistent,
+            "last_seen": time.time(),
+        }
+
+    def peers(self, exclude: Optional[str] = None) -> list[dict]:
+        now = time.time()
+        stale_keys = [
+            key for key, record in self._records.items()
+            if not record["persistent"] and now - record["last_seen"] > REGISTRY_TTL_SECONDS
+        ]
+        for key in stale_keys:
+            self._records.pop(key, None)
+        return [
+            {
+                "service_name": record["service_name"],
+                "display_name": record["display_name"],
+                "host": record["host"],
+                "port": record["port"],
+            }
+            for key, record in sorted(self._records.items())
+            if key != exclude
+        ]
+
+
 class DropInPeerServer:
-    def __init__(self, host: str, port: int, service_name: str, advertise: bool) -> None:
+    def __init__(self, host: str, port: int, service_name: str, advertise: bool, registry: TailnetRegistry) -> None:
         self.host = host
         self.port = port
         self.service_name = service_name
         self.advertise = advertise
+        self.registry = registry
         self.zeroconf: Optional[Zeroconf] = None
         self.service_info: Optional[ServiceInfo] = None
         self.peer_connection: Optional[RTCPeerConnection] = None
@@ -284,6 +320,27 @@ class DropInPeerServer:
             self.enable_microphone,
         )
         return await self.handle_state(request)
+
+    async def handle_registry_register(self, request: web.Request) -> web.StreamResponse:
+        payload = await request.json()
+        service_name = str(payload.get("service_name", "")).strip()
+        display_name = str(payload.get("display_name", "")).strip() or service_name
+        port = int(payload.get("port", 0))
+        host = request.remote or str(payload.get("host", "")).strip()
+        if not service_name or not host or port <= 0:
+            return web.json_response({"error": "service_name, host, and port are required"}, status=400)
+        self.registry.register(
+            service_name=service_name,
+            display_name=display_name,
+            host=host,
+            port=port,
+        )
+        LOG.info("registry register service=%s host=%s port=%s", service_name, host, port)
+        return web.json_response({"ok": True})
+
+    async def handle_registry_peers(self, request: web.Request) -> web.StreamResponse:
+        exclude = request.query.get("exclude")
+        return web.json_response({"peers": self.registry.peers(exclude=exclude)})
 
     async def _handle_signal(self, payload: dict) -> None:
         signal_type = payload.get("type")
@@ -484,6 +541,14 @@ async def main() -> None:
         port=args.port,
         service_name=args.name,
         advertise=not args.no_mdns,
+        registry=TailnetRegistry(),
+    )
+    server.registry.register(
+        service_name=args.name,
+        display_name=args.name.removeprefix("dropin-"),
+        host=args.host,
+        port=args.port,
+        persistent=True,
     )
     server.register_service()
 
@@ -491,6 +556,8 @@ async def main() -> None:
     app.router.add_get("/", server.handle_root)
     app.router.add_get("/api/state", server.handle_state)
     app.router.add_post("/api/config", server.handle_config)
+    app.router.add_post("/api/registry/register", server.handle_registry_register)
+    app.router.add_get("/api/registry/peers", server.handle_registry_peers)
 
     runner = web.AppRunner(app)
     await runner.setup()
