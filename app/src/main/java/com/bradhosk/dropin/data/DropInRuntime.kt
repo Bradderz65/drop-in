@@ -113,6 +113,20 @@ class DropInRuntime private constructor(
         _pendingOffer.value = null
     }
 
+    /** Re-trigger NSD and Tailnet discovery. */
+    fun refreshPeers() {
+        if (!started) return
+        peerDiscovery.stop()
+        peerDiscovery.start(signalingServer.port)
+        tailnetRegistry.stop()
+        tailnetRegistry.start(
+            localServiceName = localPeerId,
+            displayName = deviceName,
+            portProvider = { signalingServer.port },
+            registryUrl = tailnetRegistryUrl,
+        )
+    }
+
     fun sendLocal(message: SignalEnvelope) {
         signalingServer.send(message)
     }

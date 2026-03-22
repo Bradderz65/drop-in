@@ -240,6 +240,23 @@ class DropInManager(
         restoreAudioRoute()
     }
 
+    /** Returns the current round-trip time in milliseconds from the active ICE candidate pair, or null. */
+    fun getRoundTripTimeMs(callback: (Double?) -> Unit) {
+        val pc = peerConnection
+        if (pc == null) {
+            callback(null)
+            return
+        }
+        pc.getStats { report ->
+            val rtt = report?.statsMap?.values
+                ?.firstOrNull { it.type == "candidate-pair" && it.members.containsKey("currentRoundTripTime") }
+                ?.members?.get("currentRoundTripTime")
+                ?.toString()?.toDoubleOrNull()
+                ?.times(1000.0) // seconds → ms
+            callback(rtt)
+        }
+    }
+
     private fun attachRemoteVideoTrack(track: VideoTrack) {
         Log.d(logTag, "attachRemoteVideoTrack rendererReady=${remoteRenderer != null}")
         remoteVideoTrack?.removeSink(remoteRenderer)

@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
@@ -56,7 +57,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         isFullscreen = savedInstanceState?.getBoolean(KEY_FULLSCREEN) ?: false
-        enableEdgeToEdge()
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.parseColor("#0E0E10")),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.parseColor("#0E0E10")),
+        )
         DropInBackgroundService.start(this)
         requestRequiredPermissions()
         applyFullscreen(isFullscreen)
@@ -80,6 +84,7 @@ class MainActivity : ComponentActivity() {
                     onSwapViews = viewModel::swapVideoViews,
                     onSaveTailnetHost = viewModel::setSavedTailnetHost,
                     onToggleFullscreen = ::applyFullscreen,
+                    onRefresh = viewModel::refreshPeers,
                     onHangUp = viewModel::hangUp,
                     localVideo = { modifier -> VideoRenderer("local", modifier) { renderer -> onLocalRendererCreated(renderer) } },
                     remoteVideo = { modifier -> VideoRenderer("remote", modifier) { renderer -> onRemoteRendererCreated(renderer) } },

@@ -1,6 +1,7 @@
 package com.bradhosk.dropin.ui
 
 import android.app.Application
+import android.content.Context
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -23,6 +24,9 @@ import kotlinx.coroutines.launch
 import org.webrtc.IceCandidate
 import org.webrtc.SessionDescription
 
+// ── Connection quality buckets ───────────────────────────────
+enum class ConnectionQuality { EXCELLENT, GOOD, FAIR, POOR, UNKNOWN }
+
 data class DropInUiState(
     val deviceName: String,
     val devices: List<PeerDevice> = emptyList(),
@@ -36,6 +40,11 @@ data class DropInUiState(
     val isRemotePrimary: Boolean = true,
     val hasRemoteVideo: Boolean = false,
     val status: String = "Searching for local devices",
+    // ── New fields ───────────────────────────────────────────
+    val callDurationSeconds: Long = 0,
+    val connectionQuality: ConnectionQuality = ConnectionQuality.UNKNOWN,
+    val recentPeers: List<PeerDevice> = emptyList(),
+    val isRefreshing: Boolean = false,
 )
 
 class DropInViewModel(
@@ -47,9 +56,16 @@ class DropInViewModel(
     private val signalingClient = PeerSignalingClient()
     val dropInManager = DropInManager(application)
     private var connectTimeoutJob: Job? = null
+    private var callTimerJob: Job? = null
+    private var qualityPollingJob: Job? = null
+
+    private val recentPrefs = application.getSharedPreferences("dropin_recents", Context.MODE_PRIVATE)
 
     private val _uiState = MutableStateFlow(
-        DropInUiState(deviceName = runtime.deviceName),
+        DropInUiState(
+            deviceName = runtime.deviceName,
+            recentPeers = loadRecentPeers(),
+        ),
     )
     val uiState: StateFlow<DropInUiState> = _uiState.asStateFlow()
 
@@ -119,7 +135,7 @@ class DropInViewModel(
             status = "Connecting to ${peer.displayName}",
         )
         dropInManager.createPeerConnection {
-            _uiState.value = _uiState.value.copy(isInCall = true, status = "Connected to ${peer.displayName}")
+            onCallConnected(peer)
         }
         signalingClient.connect(peer.host, peer.port)
         dropInManager.createOffer { offer ->
@@ -160,11 +176,15 @@ class DropInViewModel(
         signalingClient.disconnect()
         dropInManager.endCall()
         connectTimeoutJob?.cancel()
+        stopCallTimer()
+        stopQualityPolling()
         _uiState.value = _uiState.value.copy(
             selectedPeer = null,
             isInCall = false,
             isSpeakerOn = true,
             hasRemoteVideo = false,
+            callDurationSeconds = 0,
+            connectionQuality = ConnectionQuality.UNKNOWN,
             status = "Ready for drop in",
         )
     }
@@ -204,6 +224,102 @@ class DropInViewModel(
         _uiState.value = _uiState.value.copy(isRemotePrimary = remotePrimary)
     }
 
+    /** Pull-to-refresh: restarts NSD/tailnet discovery. */
+    fun refreshPeers() {
+        _uiState.value = _uiState.value.copy(isRefreshing = true)
+        runtime.refreshPeers()
+        viewModelScope.launch {
+            delay(1_500) // brief visual feedback
+            _uiState.value = _uiState.value.copy(isRefreshing = false)
+        }
+    }
+
+    // ── Call timer ────────────────────────────────────────────
+    private fun startCallTimer() {
+        callTimerJob?.cancel()
+        _uiState.value = _uiState.value.copy(callDurationSeconds = 0)
+        callTimerJob = viewModelScope.launch {
+            var seconds = 0L
+            while (true) {
+                delay(1_000)
+                seconds++
+                _uiState.value = _uiState.value.copy(callDurationSeconds = seconds)
+            }
+        }
+    }
+
+    private fun stopCallTimer() {
+        callTimerJob?.cancel()
+        callTimerJob = null
+    }
+
+    // ── Connection quality polling ───────────────────────────
+    private fun startQualityPolling() {
+        qualityPollingJob?.cancel()
+        qualityPollingJob = viewModelScope.launch {
+            while (true) {
+                delay(3_000)
+                dropInManager.getRoundTripTimeMs { rttMs ->
+                    val quality = when {
+                        rttMs == null -> ConnectionQuality.UNKNOWN
+                        rttMs < 50    -> ConnectionQuality.EXCELLENT
+                        rttMs < 150   -> ConnectionQuality.GOOD
+                        rttMs < 300   -> ConnectionQuality.FAIR
+                        else          -> ConnectionQuality.POOR
+                    }
+                    _uiState.value = _uiState.value.copy(connectionQuality = quality)
+                }
+            }
+        }
+    }
+
+    private fun stopQualityPolling() {
+        qualityPollingJob?.cancel()
+        qualityPollingJob = null
+    }
+
+    // ── Recent peers persistence ─────────────────────────────
+    private fun addRecentPeer(peer: PeerDevice) {
+        val current = _uiState.value.recentPeers.toMutableList()
+        current.removeAll { it.serviceName == peer.serviceName }
+        current.add(0, peer)
+        val trimmed = current.take(5)
+        _uiState.value = _uiState.value.copy(recentPeers = trimmed)
+        saveRecentPeers(trimmed)
+    }
+
+    private fun saveRecentPeers(list: List<PeerDevice>) {
+        val serialized = list.joinToString("|") { "${it.serviceName};;${it.displayName};;${it.host};;${it.port}" }
+        recentPrefs.edit().putString("recents", serialized).apply()
+    }
+
+    private fun loadRecentPeers(): List<PeerDevice> {
+        val raw = recentPrefs.getString("recents", "") ?: return emptyList()
+        if (raw.isBlank()) return emptyList()
+        return raw.split("|").mapNotNull { entry ->
+            val parts = entry.split(";;")
+            if (parts.size == 4) {
+                PeerDevice(
+                    serviceName = parts[0],
+                    displayName = parts[1],
+                    host = parts[2],
+                    port = parts[3].toIntOrNull() ?: 8989,
+                )
+            } else {
+                null
+            }
+        }
+    }
+
+    // ── Called when a call is established ─────────────────────
+    private fun onCallConnected(peer: PeerDevice) {
+        _uiState.value = _uiState.value.copy(isInCall = true, status = "Connected to ${peer.displayName}")
+        addRecentPeer(peer)
+        startCallTimer()
+        startQualityPolling()
+    }
+
+    // ── Signal handling (unchanged logic) ────────────────────
     private fun handleSignal(signal: SignalEnvelope) {
         Log.d(logTag, "handleSignal type=${signal.type} from=${signal.from} to=${signal.to}")
         when (signal.type) {
@@ -214,11 +330,15 @@ class DropInViewModel(
                 signalingClient.disconnect()
                 dropInManager.endCall()
                 connectTimeoutJob?.cancel()
+                stopCallTimer()
+                stopQualityPolling()
                 _uiState.value = _uiState.value.copy(
                     isInCall = false,
                     isSpeakerOn = true,
                     hasRemoteVideo = false,
                     selectedPeer = null,
+                    callDurationSeconds = 0,
+                    connectionQuality = ConnectionQuality.UNKNOWN,
                     status = "Call ended",
                 )
             }
@@ -250,7 +370,7 @@ class DropInViewModel(
         }
         dropInManager.createPeerConnection {
             connectTimeoutJob?.cancel()
-            _uiState.value = _uiState.value.copy(isInCall = true, status = "Connected to ${peer.displayName}")
+            onCallConnected(peer)
         }
         val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, signal.sdp.orEmpty())
         dropInManager.setRemoteDescription(remoteOffer) {
@@ -275,11 +395,16 @@ class DropInViewModel(
         connectTimeoutJob?.cancel()
         val description = SessionDescription(SessionDescription.Type.ANSWER, signal.sdp.orEmpty())
         dropInManager.setRemoteDescription(description)
-        _uiState.value = _uiState.value.copy(
-            isInCall = true,
-            hasRemoteVideo = false,
-            status = "Call established",
-        )
+        val peer = _uiState.value.selectedPeer
+        if (peer != null) {
+            onCallConnected(peer)
+        } else {
+            _uiState.value = _uiState.value.copy(
+                isInCall = true,
+                hasRemoteVideo = false,
+                status = "Call established",
+            )
+        }
     }
 
     private fun handleIce(signal: SignalEnvelope) {
@@ -292,6 +417,8 @@ class DropInViewModel(
 
     override fun onCleared() {
         connectTimeoutJob?.cancel()
+        stopCallTimer()
+        stopQualityPolling()
         signalingClient.disconnect()
         dropInManager.release()
         super.onCleared()
