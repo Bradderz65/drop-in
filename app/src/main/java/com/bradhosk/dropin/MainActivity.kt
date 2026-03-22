@@ -12,8 +12,6 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -28,6 +26,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.bradhosk.dropin.ui.DropInScreen
+import com.bradhosk.dropin.ui.DropInTheme
 import com.bradhosk.dropin.ui.DropInViewModel
 import org.webrtc.SurfaceViewRenderer
 
@@ -63,9 +62,7 @@ class MainActivity : ComponentActivity() {
         applyFullscreen(isFullscreen)
 
         setContent {
-            MaterialTheme(
-                colorScheme = lightColorScheme(),
-            ) {
+            DropInTheme {
                 val state by viewModel.uiState.collectAsState()
                 LaunchedEffect(state.isInCall) {
                     if (!state.isInCall) {

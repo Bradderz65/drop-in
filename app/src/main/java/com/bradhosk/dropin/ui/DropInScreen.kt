@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -34,15 +35,16 @@ import androidx.compose.material.icons.rounded.VolumeOff
 import androidx.compose.material.icons.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material.icons.rounded.VideocamOff
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -54,14 +56,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.zIndex
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import com.bradhosk.dropin.model.PeerDevice
 import kotlinx.coroutines.delay
+
+// ── Shorthand palette access ────────────────────────────────
+private val C = DropInColors
 
 @Composable
 fun DropInScreen(
@@ -108,33 +114,31 @@ fun DropInScreen(
 
     Surface(
         modifier = Modifier.fillMaxSize(),
-        color = Color(0xFF06131F),
+        color = C.background,
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        colors = listOf(Color(0xFF06131F), Color(0xFF0A2235), Color(0xFF102336)),
-                    ),
-                )
-                .padding(if (isFullscreen) 0.dp else 16.dp),
+                .padding(if (isFullscreen) 0.dp else 20.dp),
         ) {
+            // ── Header (hidden in fullscreen) ────────────────
             if (!isFullscreen) {
+                Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "Drop In",
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
+                    text = "drop in",
+                    style = MaterialTheme.typography.headlineLarge,
+                    color = C.textPrimary,
                 )
+                Spacer(modifier = Modifier.height(2.dp))
                 Text(
                     text = state.status,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color(0xFF91A3B7),
+                    color = C.textSecondary,
                 )
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(24.dp))
             }
 
+            // ── In-call video area ───────────────────────────
             if (state.isInCall) {
                 Box(
                     modifier = if (isFullscreen) {
@@ -142,51 +146,54 @@ fun DropInScreen(
                             .fillMaxWidth()
                             .weight(1f)
                             .clip(RoundedCornerShape(0.dp))
-                            .background(Color(0xFF13293D))
+                            .background(Color(0xFF111113))
                     } else {
                         Modifier
                             .fillMaxWidth()
                             .height(320.dp)
-                            .clip(RoundedCornerShape(28.dp))
-                            .background(Color(0xFF13293D))
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(Color(0xFF111113))
                     },
                 ) {
-                    val fullScreenModifier = Modifier
+                    // Video modifiers
+                    val fullScreenMod = Modifier
                         .matchParentSize()
                         .zIndex(0f)
-                    val pipModifier = Modifier
+                    val pipMod = Modifier
                         .align(Alignment.TopEnd)
-                        .padding(14.dp)
-                        .size(132.dp)
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(Color(0xFF0F1E2A))
+                        .padding(12.dp)
+                        .size(120.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(C.surface)
                         .zIndex(1f)
-                    val hiddenModifier = Modifier
+                    val hiddenMod = Modifier
                         .align(Alignment.BottomStart)
                         .padding(1.dp)
                         .size(1.dp)
                         .zIndex(-1f)
+
                     val remoteShouldBePrimary = if (isFullscreen) {
                         state.hasRemoteVideo
                     } else {
                         state.isRemotePrimary
                     }
                     val remoteModifier = when {
-                        isFullscreen && remoteShouldBePrimary -> fullScreenModifier
-                        isFullscreen -> hiddenModifier
-                        remoteShouldBePrimary -> fullScreenModifier
-                        else -> pipModifier
+                        isFullscreen && remoteShouldBePrimary -> fullScreenMod
+                        isFullscreen -> hiddenMod
+                        remoteShouldBePrimary -> fullScreenMod
+                        else -> pipMod
                     }
                     val localModifier = when {
-                        isFullscreen && remoteShouldBePrimary -> hiddenModifier
-                        isFullscreen -> fullScreenModifier
-                        remoteShouldBePrimary -> pipModifier
-                        else -> fullScreenModifier
+                        isFullscreen && remoteShouldBePrimary -> hiddenMod
+                        isFullscreen -> fullScreenMod
+                        remoteShouldBePrimary -> pipMod
+                        else -> fullScreenMod
                     }
 
                     remoteVideo(remoteModifier)
                     localVideo(localModifier)
 
+                    // Tap to reveal controls
                     Box(
                         modifier = Modifier
                             .matchParentSize()
@@ -201,171 +208,130 @@ fun DropInScreen(
                             },
                     )
 
+                    // ── Frosted control pill ─────────────────
                     androidx.compose.animation.AnimatedVisibility(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
-                            .padding(bottom = 18.dp),
+                            .padding(bottom = 16.dp),
                         visible = areControlsVisible,
                         enter = fadeIn(),
                         exit = fadeOut(),
                     ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        Row(
+                            modifier = Modifier
+                                .background(
+                                    color = Color(0xD91A1A1E),
+                                    shape = RoundedCornerShape(50),
+                                )
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(14.dp),
-                                verticalAlignment = Alignment.CenterVertically,
+                            ControlPill(
+                                icon = if (state.isMicOn) Icons.Rounded.Mic else Icons.Rounded.MicOff,
+                                label = if (state.isMicOn) "Mute" else "Unmute",
+                                isActive = state.isMicOn,
+                                onClick = {
+                                    revealControls()
+                                    onToggleMic(!state.isMicOn)
+                                },
+                            )
+                            ControlPill(
+                                icon = if (state.isCameraOn) Icons.Rounded.Videocam else Icons.Rounded.VideocamOff,
+                                label = if (state.isCameraOn) "Cam off" else "Cam on",
+                                isActive = state.isCameraOn,
+                                onClick = {
+                                    revealControls()
+                                    onToggleCamera(!state.isCameraOn)
+                                },
+                            )
+                            ControlPill(
+                                icon = Icons.Rounded.Cameraswitch,
+                                label = "Flip",
+                                onClick = {
+                                    revealControls()
+                                    onSwitchCamera()
+                                },
+                            )
+                            ControlPill(
+                                icon = if (state.isSpeakerOn) Icons.Rounded.VolumeUp else Icons.Rounded.VolumeOff,
+                                label = if (state.isSpeakerOn) "Earpiece" else "Speaker",
+                                isActive = state.isSpeakerOn,
+                                onClick = {
+                                    revealControls()
+                                    onToggleSpeaker(!state.isSpeakerOn)
+                                },
+                            )
+                            ControlPill(
+                                icon = Icons.Rounded.SwapHoriz,
+                                label = "Swap",
+                                onClick = {
+                                    revealControls()
+                                    onSwapViews()
+                                },
+                            )
+                            ControlPill(
+                                icon = if (isFullscreen) Icons.Rounded.FullscreenExit else Icons.Rounded.Fullscreen,
+                                label = if (isFullscreen) "Shrink" else "Expand",
+                                onClick = {
+                                    revealControls()
+                                    onToggleFullscreen(!isFullscreen)
+                                },
+                            )
+                            // Hang-up — danger accent
+                            IconButton(
+                                onClick = {
+                                    revealControls()
+                                    if (isFullscreen) onToggleFullscreen(false)
+                                    onHangUp()
+                                },
+                                modifier = Modifier.size(42.dp),
+                                colors = IconButtonDefaults.iconButtonColors(
+                                    containerColor = C.danger,
+                                    contentColor = Color.White,
+                                ),
                             ) {
-                                ToggleFab(
-                                    enabled = state.isMicOn,
-                                    onClick = {
-                                        revealControls()
-                                        onToggleMic(!state.isMicOn)
-                                    },
-                                    activeIcon = { Icon(Icons.Rounded.Mic, contentDescription = "Mute", tint = Color.White) },
-                                    inactiveIcon = { Icon(Icons.Rounded.MicOff, contentDescription = "Unmute", tint = Color.White) },
+                                Icon(
+                                    Icons.Rounded.CallEnd,
+                                    contentDescription = "Hang up",
+                                    modifier = Modifier.size(20.dp),
                                 )
-                                ToggleFab(
-                                    enabled = state.isCameraOn,
-                                    onClick = {
-                                        revealControls()
-                                        onToggleCamera(!state.isCameraOn)
-                                    },
-                                    activeIcon = { Icon(Icons.Rounded.Videocam, contentDescription = "Disable camera", tint = Color.White) },
-                                    inactiveIcon = { Icon(Icons.Rounded.VideocamOff, contentDescription = "Enable camera", tint = Color.White) },
-                                )
-                                FloatingActionButton(
-                                    onClick = {
-                                        revealControls()
-                                        onSwitchCamera()
-                                    },
-                                    containerColor = Color(0xCC102336),
-                                    shape = CircleShape,
-                                ) {
-                                    Icon(
-                                        Icons.Rounded.Cameraswitch,
-                                        contentDescription = if (state.isUsingFrontCamera) "Switch to back camera" else "Switch to front camera",
-                                        tint = Color.White,
-                                    )
-                                }
-                            }
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(14.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                FloatingActionButton(
-                                    onClick = {
-                                        revealControls()
-                                        onSwapViews()
-                                    },
-                                    containerColor = Color(0xCC102336),
-                                    shape = CircleShape,
-                                ) {
-                                    Icon(Icons.Rounded.SwapHoriz, contentDescription = "Swap video views", tint = Color.White)
-                                }
-                                ToggleFab(
-                                    enabled = state.isSpeakerOn,
-                                    onClick = {
-                                        revealControls()
-                                        onToggleSpeaker(!state.isSpeakerOn)
-                                    },
-                                    activeIcon = { Icon(Icons.Rounded.VolumeUp, contentDescription = "Use earpiece", tint = Color.White) },
-                                    inactiveIcon = { Icon(Icons.Rounded.VolumeOff, contentDescription = "Use speaker", tint = Color.White) },
-                                )
-                                FloatingActionButton(
-                                    onClick = {
-                                        revealControls()
-                                        onToggleFullscreen(!isFullscreen)
-                                    },
-                                    containerColor = Color(0xCC102336),
-                                    shape = CircleShape,
-                                ) {
-                                    Icon(
-                                        imageVector = if (isFullscreen) Icons.Rounded.FullscreenExit else Icons.Rounded.Fullscreen,
-                                        contentDescription = if (isFullscreen) "Exit fullscreen" else "Enter fullscreen",
-                                        tint = Color.White,
-                                    )
-                                }
-                                FloatingActionButton(
-                                    onClick = {
-                                        revealControls()
-                                        if (isFullscreen) {
-                                            onToggleFullscreen(false)
-                                        }
-                                        onHangUp()
-                                    },
-                                    containerColor = Color(0xFFFF6B6B),
-                                    shape = CircleShape,
-                                ) {
-                                    Icon(Icons.Rounded.CallEnd, contentDescription = "Hang up", tint = Color.White)
-                                }
                             }
                         }
                     }
                 }
             }
 
+            // ── Peer list (hidden in fullscreen) ─────────────
             if (!isFullscreen) {
                 if (state.isInCall) {
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(20.dp))
                 }
                 LazyColumn(
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f),
                     contentPadding = PaddingValues(bottom = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
+                    // Tailscale config card
                     item {
-                        Card(
-                            colors = CardDefaults.cardColors(containerColor = Color(0xCC18324A)),
-                            shape = RoundedCornerShape(24.dp),
-                        ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(18.dp),
-                                verticalArrangement = Arrangement.spacedBy(12.dp),
-                            ) {
-                                Text(
-                                    text = "Saved Tailscale Peer",
-                                    color = Color.White,
-                                    fontWeight = FontWeight.SemiBold,
-                                )
-                                Text(
-                                    text = "Save one Tailscale IP or hostname and it will appear in the peer list for quick connect.",
-                                    color = Color(0xFF91A3B7),
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
-                                OutlinedTextField(
-                                    value = tailnetHostDraft,
-                                    onValueChange = { tailnetHostDraft = it },
-                                    modifier = Modifier.fillMaxWidth(),
-                                    label = { Text("Tailscale host or IP") },
-                                    placeholder = { Text("100.x.y.z or machine-name") },
-                                    singleLine = true,
-                                )
-                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                    Button(onClick = { onSaveTailnetHost(tailnetHostDraft) }) {
-                                        Text("Save")
-                                    }
-                                    Button(onClick = {
-                                        tailnetHostDraft = ""
-                                        onSaveTailnetHost("")
-                                    }) {
-                                        Text("Disable")
-                                    }
-                                }
-                            }
-                        }
+                        TailscaleCard(
+                            draft = tailnetHostDraft,
+                            onDraftChange = { tailnetHostDraft = it },
+                            onSave = { onSaveTailnetHost(tailnetHostDraft) },
+                            onDisable = {
+                                tailnetHostDraft = ""
+                                onSaveTailnetHost("")
+                            },
+                        )
                     }
+                    // Section header
                     item {
                         Text(
-                            text = "Available peers",
+                            text = "PEERS",
                             style = MaterialTheme.typography.titleMedium,
-                            color = Color.White,
-                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(top = 8.dp),
                         )
                     }
                     items(state.devices, key = { it.serviceName }) { peer ->
@@ -377,61 +343,152 @@ fun DropInScreen(
     }
 }
 
+// ── Tailscale config card ────────────────────────────────────
 @Composable
-private fun PeerCard(
-    peer: PeerDevice,
-    onConnect: () -> Unit,
+private fun TailscaleCard(
+    draft: String,
+    onDraftChange: (String) -> Unit,
+    onSave: () -> Unit,
+    onDisable: () -> Unit,
 ) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = Color(0xCC18324A)),
-        shape = RoundedCornerShape(24.dp),
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(C.surface, RoundedCornerShape(16.dp))
+            .border(1.dp, C.border, RoundedCornerShape(16.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 18.dp, vertical = 14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(48.dp)
-                    .clip(CircleShape)
-                    .background(Color(0xFF39D98A)),
-                contentAlignment = Alignment.Center,
+        Text(
+            text = "Tailscale Peer",
+            style = MaterialTheme.typography.bodyLarge,
+            fontWeight = FontWeight.Medium,
+            color = C.textPrimary,
+        )
+        Text(
+            text = "Save a Tailscale IP or hostname for quick connect.",
+            style = MaterialTheme.typography.bodySmall,
+            color = C.textSecondary,
+        )
+        OutlinedTextField(
+            value = draft,
+            onValueChange = onDraftChange,
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Host or IP", color = C.textSecondary) },
+            placeholder = { Text("100.x.y.z", color = C.textSecondary.copy(alpha = 0.5f)) },
+            singleLine = true,
+            shape = RoundedCornerShape(12.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = C.accent,
+                unfocusedBorderColor = C.border,
+                cursorColor = C.accent,
+                focusedLabelColor = C.accent,
+                focusedTextColor = C.textPrimary,
+                unfocusedTextColor = C.textPrimary,
+            ),
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            OutlinedButton(
+                onClick = onSave,
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = C.accent),
+                border = ButtonDefaults.outlinedButtonBorder(enabled = true).copy(
+                    brush = androidx.compose.ui.graphics.SolidColor(C.accent.copy(alpha = 0.4f)),
+                ),
             ) {
-                Text(
-                    text = peer.displayName.take(1).uppercase(),
-                    color = Color(0xFF062014),
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                )
+                Text("Save", fontSize = 13.sp)
             }
-            Spacer(modifier = Modifier.width(14.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(peer.displayName, color = Color.White, fontWeight = FontWeight.SemiBold)
-                Text("${peer.host}:${peer.port}", color = Color(0xFF91A3B7))
-            }
-            Button(onClick = onConnect) {
-                Icon(Icons.Rounded.Call, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Drop in")
+            OutlinedButton(
+                onClick = onDisable,
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = C.textSecondary),
+                border = ButtonDefaults.outlinedButtonBorder(enabled = true).copy(
+                    brush = androidx.compose.ui.graphics.SolidColor(C.border),
+                ),
+            ) {
+                Text("Clear", fontSize = 13.sp)
             }
         }
     }
 }
 
+// ── Peer card ────────────────────────────────────────────────
 @Composable
-private fun ToggleFab(
-    enabled: Boolean,
-    onClick: () -> Unit,
-    activeIcon: @Composable () -> Unit,
-    inactiveIcon: @Composable () -> Unit,
+private fun PeerCard(
+    peer: PeerDevice,
+    onConnect: () -> Unit,
 ) {
-    FloatingActionButton(
-        onClick = onClick,
-        containerColor = if (enabled) Color(0xCC102336) else Color(0xCC3A1B24),
-        shape = CircleShape,
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(C.surface, RoundedCornerShape(14.dp))
+            .border(1.dp, C.border, RoundedCornerShape(14.dp))
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (enabled) activeIcon() else inactiveIcon()
+        // Monogram avatar
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .clip(CircleShape)
+                .background(C.accentDim),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = peer.displayName.take(1).uppercase(),
+                color = C.accent,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = peer.displayName,
+                color = C.textPrimary,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = "${peer.host}:${peer.port}",
+                style = MaterialTheme.typography.bodySmall,
+                color = C.textSecondary,
+            )
+        }
+        OutlinedButton(
+            onClick = onConnect,
+            shape = RoundedCornerShape(50),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = C.accent),
+            border = ButtonDefaults.outlinedButtonBorder(enabled = true).copy(
+                brush = androidx.compose.ui.graphics.SolidColor(C.accent.copy(alpha = 0.4f)),
+            ),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+        ) {
+            Text("Connect", fontSize = 13.sp)
+        }
+    }
+}
+
+// ── Single control button inside the pill bar ────────────────
+@Composable
+private fun ControlPill(
+    icon: ImageVector,
+    label: String,
+    isActive: Boolean = true,
+    onClick: () -> Unit,
+) {
+    IconButton(
+        onClick = onClick,
+        modifier = Modifier.size(42.dp),
+        colors = IconButtonDefaults.iconButtonColors(
+            containerColor = if (isActive) Color.Transparent else C.controlOff,
+            contentColor = Color.White,
+        ),
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            modifier = Modifier.size(20.dp),
+        )
     }
 }
