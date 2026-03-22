@@ -1,6 +1,7 @@
 package com.bradhosk.dropin.ui
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.bradhosk.dropin.data.IceCandidatePayload
@@ -34,6 +35,7 @@ data class DropInUiState(
 class DropInViewModel(
     application: Application,
 ) : AndroidViewModel(application) {
+    private val logTag = "DropInApp"
     private val deviceName = "dropin-${android.os.Build.MODEL}-${UUID.randomUUID().toString().take(4)}"
     private val signalingServer = LocalSignalingServer()
     private val signalingClient = PeerSignalingClient()
@@ -83,6 +85,7 @@ class DropInViewModel(
     }
 
     fun connectToPeer(peer: PeerDevice) {
+        Log.d(logTag, "connectToPeer peer=${peer.displayName} host=${peer.host}:${peer.port}")
         dropInManager.endCall()
         signalingClient.disconnect()
         _uiState.value = _uiState.value.copy(
@@ -107,6 +110,7 @@ class DropInViewModel(
     }
 
     fun hangUp() {
+        Log.d(logTag, "hangUp tapped selectedPeer=${_uiState.value.selectedPeer?.displayName} isInCall=${_uiState.value.isInCall}")
         signalingClient.send(SignalEnvelope(type = SignalType.HANGUP, from = deviceName))
         signalingServer.send(SignalEnvelope(type = SignalType.HANGUP, from = deviceName))
         signalingClient.disconnect()
@@ -129,6 +133,7 @@ class DropInViewModel(
     }
 
     private fun handleSignal(signal: SignalEnvelope) {
+        Log.d(logTag, "handleSignal type=${signal.type} from=${signal.from} to=${signal.to}")
         when (signal.type) {
             SignalType.OFFER -> handleOffer(signal)
             SignalType.ANSWER -> handleAnswer(signal)
@@ -143,6 +148,7 @@ class DropInViewModel(
 
     private fun handleOffer(signal: SignalEnvelope) {
         val peer = peers.value.firstOrNull { it.serviceName == signal.from } ?: return
+        Log.d(logTag, "handleOffer peer=${peer.displayName}")
         _uiState.value = _uiState.value.copy(selectedPeer = peer, status = "Incoming drop in from ${peer.displayName}")
 
         dropInManager.endCall()
@@ -166,12 +172,14 @@ class DropInViewModel(
     }
 
     private fun handleAnswer(signal: SignalEnvelope) {
+        Log.d(logTag, "handleAnswer from=${signal.from}")
         val description = SessionDescription(SessionDescription.Type.ANSWER, signal.sdp.orEmpty())
         dropInManager.setRemoteDescription(description)
         _uiState.value = _uiState.value.copy(isInCall = true, status = "Call established")
     }
 
     private fun handleIce(signal: SignalEnvelope) {
+        Log.d(logTag, "handleIce from=${signal.from}")
         val candidate = signal.candidate ?: return
         dropInManager.addIceCandidate(
             IceCandidate(candidate.sdpMid, candidate.sdpMLineIndex, candidate.sdpCandidate),

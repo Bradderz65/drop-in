@@ -72,7 +72,7 @@ dependencies {
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.nanohttpd:nanohttpd-websocket:2.3.1")
-    implementation("com.infobip:google-webrtc:1.0.45036")
+    implementation("com.infobip:google-webrtc:1.0.35530")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

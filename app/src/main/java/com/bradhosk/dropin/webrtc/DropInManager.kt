@@ -1,6 +1,7 @@
 package com.bradhosk.dropin.webrtc
 
 import android.content.Context
+import android.util.Log
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
 import org.webrtc.Camera2Enumerator
@@ -22,6 +23,7 @@ import org.webrtc.VideoTrack
 class DropInManager(
     context: Context,
 ) {
+    private val logTag = "DropInApp"
     private val appContext = context.applicationContext
     private val eglBase = EglBase.create()
     private val peerFactory: PeerConnectionFactory
@@ -64,6 +66,7 @@ class DropInManager(
     }
 
     fun startLocalMedia() {
+        Log.d(logTag, "startLocalMedia")
         if (localVideoTrack != null) return
 
         val surfaceTextureHelper = SurfaceTextureHelper.create("DropInCaptureThread", eglBase.eglBaseContext)
@@ -79,6 +82,7 @@ class DropInManager(
     }
 
     fun createPeerConnection(onConnected: () -> Unit) {
+        Log.d(logTag, "createPeerConnection existing=${peerConnection != null}")
         if (peerConnection != null) return
         val rtcConfig = PeerConnection.RTCConfiguration(
             listOf(
@@ -89,6 +93,7 @@ class DropInManager(
             rtcConfig,
             object : PeerConnection.Observer {
                 override fun onIceCandidate(candidate: IceCandidate) {
+                    Log.d(logTag, "onIceCandidate")
                     onIceCandidate(candidate)
                 }
 
@@ -99,6 +104,7 @@ class DropInManager(
                 }
 
                 override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
+                    Log.d(logTag, "onConnectionChange state=$newState")
                     if (newState == PeerConnection.PeerConnectionState.CONNECTED) {
                         onConnected()
                     }
@@ -174,6 +180,7 @@ class DropInManager(
     }
 
     fun endCall() {
+        Log.d(logTag, "endCall")
         peerConnection?.close()
         peerConnection?.dispose()
         peerConnection = null

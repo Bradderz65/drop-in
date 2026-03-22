@@ -105,7 +105,7 @@ fun DropInScreen(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 18.dp),
-                    visible = true,
+                    visible = state.isInCall,
                 ) {
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
