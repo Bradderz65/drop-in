@@ -1,3 +1,9 @@
 <resources>
     <string name="app_name">Drop In</string>
+    <string name="notification_channel_name">Drop In background</string>
+    <string name="notification_channel_description">Keeps local drop-in discovery and signaling active.</string>
+    <string name="notification_service_title">Drop In is ready</string>
+    <string name="notification_service_text">Listening for local drop-ins in the background.</string>
+    <string name="notification_incoming_title">Incoming drop-in</string>
+    <string name="notification_incoming_text">%1$s is trying to connect.</string>
 </resources>

@@ -5,8 +5,7 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.bradhosk.dropin.data.IceCandidatePayload
-import com.bradhosk.dropin.data.LocalSignalingServer
-import com.bradhosk.dropin.data.NsdPeerDiscovery
+import com.bradhosk.dropin.data.DropInRuntime
 import com.bradhosk.dropin.data.PeerSignalingClient
 import com.bradhosk.dropin.data.PeerSignalingStatus
 import com.bradhosk.dropin.data.SignalEnvelope
@@ -23,7 +22,6 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import org.webrtc.IceCandidate
 import org.webrtc.SessionDescription
-import java.util.UUID
 
 data class DropInUiState(
     val deviceName: String,
@@ -42,55 +40,48 @@ class DropInViewModel(
     application: Application,
 ) : AndroidViewModel(application) {
     private val logTag = "DropInApp"
-    private val deviceName = "dropin-${android.os.Build.MODEL}-${UUID.randomUUID().toString().take(4)}"
-    private val signalingServer = LocalSignalingServer()
+    private val runtime = DropInRuntime.getInstance(application)
+    private val deviceName = runtime.localPeerId
     private val signalingClient = PeerSignalingClient()
-    private val peerDiscovery = NsdPeerDiscovery(application, deviceName)
     val dropInManager = DropInManager(application)
     private var connectTimeoutJob: Job? = null
 
     private val _uiState = MutableStateFlow(
-        DropInUiState(deviceName = deviceName.removePrefix("dropin-")),
+        DropInUiState(deviceName = runtime.deviceName),
     )
     val uiState: StateFlow<DropInUiState> = _uiState.asStateFlow()
 
-    val peers = peerDiscovery.peers.stateIn(
+    val peers = runtime.peers.stateIn(
         viewModelScope,
         SharingStarted.WhileSubscribed(5_000),
         emptyList(),
     )
 
     init {
+        runtime.start()
         dropInManager.onIceCandidateDiscovered = { candidate ->
             _uiState.value.selectedPeer?.let { peer ->
                 signalingClient.send(candidate.toSignalEnvelope(peer.serviceName))
-                signalingServer.send(candidate.toSignalEnvelope(peer.serviceName))
-            }
-        }
-
-        signalingServer.start()
-        peerDiscovery.start(signalingServer.port)
-
-        viewModelScope.launch {
-            peerDiscovery.peers.collect { devices ->
-                val manualDevices = listOf(
-                    PeerDevice(
-                        serviceName = "dropin-PC-Test",
-                        displayName = "PC Test",
-                        host = "192.168.0.19",
-                        port = 8989,
-                    ),
-                )
-                _uiState.value = _uiState.value.copy(
-                    devices = (manualDevices + devices)
-                        .distinctBy { it.serviceName }
-                        .sortedBy { it.displayName.lowercase() },
-                )
+                runtime.sendLocal(candidate.toSignalEnvelope(peer.serviceName))
             }
         }
 
         viewModelScope.launch {
-            signalingServer.events.collect(::handleSignal)
+            runtime.peers.collect { devices ->
+                _uiState.value = _uiState.value.copy(devices = devices)
+            }
+        }
+
+        viewModelScope.launch {
+            runtime.signals.collect(::handleSignal)
+        }
+
+        viewModelScope.launch {
+            runtime.pendingOffer.collect { signal ->
+                if (signal == null) return@collect
+                runtime.consumePendingOffer()
+                handleOffer(signal)
+            }
         }
 
         viewModelScope.launch {
@@ -148,7 +139,7 @@ class DropInViewModel(
     fun hangUp() {
         Log.d(logTag, "hangUp tapped selectedPeer=${_uiState.value.selectedPeer?.displayName} isInCall=${_uiState.value.isInCall}")
         signalingClient.send(SignalEnvelope(type = SignalType.HANGUP, from = deviceName))
-        signalingServer.send(SignalEnvelope(type = SignalType.HANGUP, from = deviceName))
+        runtime.sendLocal(SignalEnvelope(type = SignalType.HANGUP, from = deviceName))
         signalingClient.disconnect()
         dropInManager.endCall()
         connectTimeoutJob?.cancel()
@@ -228,7 +219,7 @@ class DropInViewModel(
         dropInManager.setRemoteDescription(remoteOffer) {
             dropInManager.createAnswer { answer ->
                 Log.d(logTag, "sending answer to=${peer.serviceName}")
-                signalingServer.send(
+                runtime.sendLocal(
                     SignalEnvelope(
                         type = SignalType.ANSWER,
                         from = deviceName,
@@ -259,9 +250,7 @@ class DropInViewModel(
 
     override fun onCleared() {
         connectTimeoutJob?.cancel()
-        peerDiscovery.stop()
         signalingClient.disconnect()
-        signalingServer.stop()
         dropInManager.release()
         super.onCleared()
     }

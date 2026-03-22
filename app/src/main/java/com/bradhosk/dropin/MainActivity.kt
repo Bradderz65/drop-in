@@ -1,6 +1,9 @@
 package com.bradhosk.dropin
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -12,21 +15,37 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.bradhosk.dropin.ui.DropInScreen
 import com.bradhosk.dropin.ui.DropInViewModel
 import org.webrtc.SurfaceViewRenderer
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        private const val KEY_FULLSCREEN = "fullscreen"
+
+        fun createLaunchIntent(context: Context): Intent =
+            Intent(context, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            }
+    }
+
     private val viewModel: DropInViewModel by viewModels()
     private var permissionsGranted = false
     private var localRenderer: SurfaceViewRenderer? = null
     private var remoteRenderer: SurfaceViewRenderer? = null
+    private var isFullscreen by mutableStateOf(false)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -37,27 +56,49 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        isFullscreen = savedInstanceState?.getBoolean(KEY_FULLSCREEN) ?: false
         enableEdgeToEdge()
+        DropInBackgroundService.start(this)
         requestRequiredPermissions()
+        applyFullscreen(isFullscreen)
 
         setContent {
             MaterialTheme(
                 colorScheme = lightColorScheme(),
             ) {
                 val state by viewModel.uiState.collectAsState()
+                LaunchedEffect(state.isInCall) {
+                    if (!state.isInCall && isFullscreen) {
+                        applyFullscreen(false)
+                    }
+                }
                 DropInScreen(
                     state = state,
+                    isFullscreen = isFullscreen,
                     onConnect = viewModel::connectToPeer,
                     onToggleMic = viewModel::setMicEnabled,
                     onToggleCamera = viewModel::setCameraEnabled,
                     onToggleSpeaker = viewModel::setSpeakerEnabled,
                     onSwitchCamera = viewModel::switchCamera,
                     onSwapViews = viewModel::swapVideoViews,
+                    onToggleFullscreen = ::applyFullscreen,
                     onHangUp = viewModel::hangUp,
                     localVideo = { modifier -> VideoRenderer("local", modifier) { renderer -> onLocalRendererCreated(renderer) } },
                     remoteVideo = { modifier -> VideoRenderer("remote", modifier) { renderer -> onRemoteRendererCreated(renderer) } },
                 )
             }
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(KEY_FULLSCREEN, isFullscreen)
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && isFullscreen) {
+            applyFullscreen(true)
         }
     }
 
@@ -67,6 +108,7 @@ class MainActivity : ComponentActivity() {
             add(Manifest.permission.RECORD_AUDIO)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add(Manifest.permission.NEARBY_WIFI_DEVICES)
+                add(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
         permissionLauncher.launch(permissions.toTypedArray())
@@ -105,5 +147,24 @@ class MainActivity : ComponentActivity() {
     private fun onRemoteRendererCreated(renderer: SurfaceViewRenderer) {
         remoteRenderer = renderer
         maybeStartLocalMedia()
+    }
+
+    private fun applyFullscreen(enabled: Boolean) {
+        isFullscreen = enabled
+        requestedOrientation = if (enabled) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+        }
+
+        WindowCompat.setDecorFitsSystemWindows(window, !enabled)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            if (enabled) {
+                hide(WindowInsetsCompat.Type.systemBars())
+            } else {
+                show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
     }
 }

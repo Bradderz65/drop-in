@@ -1,7 +1,10 @@
 package com.bradhosk.dropin.ui
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,6 +26,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CallEnd
 import androidx.compose.material.icons.rounded.Cameraswitch
+import androidx.compose.material.icons.rounded.Fullscreen
+import androidx.compose.material.icons.rounded.FullscreenExit
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.MicOff
 import androidx.compose.material.icons.rounded.SwapHoriz
@@ -40,29 +45,62 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.bradhosk.dropin.model.PeerDevice
+import kotlinx.coroutines.delay
 
 @Composable
 fun DropInScreen(
     state: DropInUiState,
+    isFullscreen: Boolean,
     onConnect: (PeerDevice) -> Unit,
     onToggleMic: (Boolean) -> Unit,
     onToggleCamera: (Boolean) -> Unit,
     onToggleSpeaker: (Boolean) -> Unit,
     onSwitchCamera: () -> Unit,
     onSwapViews: () -> Unit,
+    onToggleFullscreen: (Boolean) -> Unit,
     onHangUp: () -> Unit,
     localVideo: @Composable (Modifier) -> Unit,
     remoteVideo: @Composable (Modifier) -> Unit,
 ) {
+    var areControlsVisible by rememberSaveable(state.isInCall) { mutableStateOf(true) }
+    var controlsInteractionCount by remember { mutableIntStateOf(0) }
+
+    fun revealControls() {
+        areControlsVisible = true
+        controlsInteractionCount++
+    }
+
+    LaunchedEffect(state.isInCall) {
+        if (!state.isInCall) {
+            areControlsVisible = true
+        } else {
+            revealControls()
+        }
+    }
+
+    LaunchedEffect(state.isInCall, areControlsVisible, controlsInteractionCount) {
+        if (!state.isInCall || !areControlsVisible) return@LaunchedEffect
+        delay(5_000)
+        areControlsVisible = false
+    }
+
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = Color(0xFF06131F),
@@ -75,26 +113,28 @@ fun DropInScreen(
                         colors = listOf(Color(0xFF06131F), Color(0xFF0A2235), Color(0xFF102336)),
                     ),
                 )
-                .padding(16.dp),
+                .padding(if (isFullscreen) 0.dp else 16.dp),
         ) {
-            Text(
-                text = "Drop In",
-                style = MaterialTheme.typography.headlineMedium,
-                color = Color.White,
-                fontWeight = FontWeight.Bold,
-            )
-            Text(
-                text = state.status,
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color(0xFF91A3B7),
-            )
-            Spacer(modifier = Modifier.height(16.dp))
+            if (!isFullscreen) {
+                Text(
+                    text = "Drop In",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = state.status,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFF91A3B7),
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+            }
 
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
-                    .clip(RoundedCornerShape(28.dp))
+                    .clip(if (isFullscreen) RoundedCornerShape(0.dp) else RoundedCornerShape(28.dp))
                     .background(Color(0xFF13293D)),
             ) {
                 val fullScreenModifier = Modifier
@@ -113,11 +153,27 @@ fun DropInScreen(
                 remoteVideo(remoteModifier)
                 localVideo(localModifier)
 
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .pointerInput(state.isInCall) {
+                            detectTapGestures(
+                                onTap = {
+                                    if (state.isInCall) {
+                                        revealControls()
+                                    }
+                                },
+                            )
+                        },
+                )
+
                 androidx.compose.animation.AnimatedVisibility(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 18.dp),
-                    visible = state.isInCall,
+                    visible = state.isInCall && areControlsVisible,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
                 ) {
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
@@ -129,18 +185,27 @@ fun DropInScreen(
                         ) {
                             ToggleFab(
                                 enabled = state.isMicOn,
-                                onClick = { onToggleMic(!state.isMicOn) },
+                                onClick = {
+                                    revealControls()
+                                    onToggleMic(!state.isMicOn)
+                                },
                                 activeIcon = { Icon(Icons.Rounded.Mic, contentDescription = "Mute", tint = Color.White) },
                                 inactiveIcon = { Icon(Icons.Rounded.MicOff, contentDescription = "Unmute", tint = Color.White) },
                             )
                             ToggleFab(
                                 enabled = state.isCameraOn,
-                                onClick = { onToggleCamera(!state.isCameraOn) },
+                                onClick = {
+                                    revealControls()
+                                    onToggleCamera(!state.isCameraOn)
+                                },
                                 activeIcon = { Icon(Icons.Rounded.Videocam, contentDescription = "Disable camera", tint = Color.White) },
                                 inactiveIcon = { Icon(Icons.Rounded.VideocamOff, contentDescription = "Enable camera", tint = Color.White) },
                             )
                             FloatingActionButton(
-                                onClick = onSwitchCamera,
+                                onClick = {
+                                    revealControls()
+                                    onSwitchCamera()
+                                },
                                 containerColor = Color(0xCC102336),
                                 shape = CircleShape,
                             ) {
@@ -156,7 +221,10 @@ fun DropInScreen(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             FloatingActionButton(
-                                onClick = onSwapViews,
+                                onClick = {
+                                    revealControls()
+                                    onSwapViews()
+                                },
                                 containerColor = Color(0xCC102336),
                                 shape = CircleShape,
                             ) {
@@ -164,12 +232,35 @@ fun DropInScreen(
                             }
                             ToggleFab(
                                 enabled = state.isSpeakerOn,
-                                onClick = { onToggleSpeaker(!state.isSpeakerOn) },
+                                onClick = {
+                                    revealControls()
+                                    onToggleSpeaker(!state.isSpeakerOn)
+                                },
                                 activeIcon = { Icon(Icons.Rounded.VolumeUp, contentDescription = "Use earpiece", tint = Color.White) },
                                 inactiveIcon = { Icon(Icons.Rounded.VolumeOff, contentDescription = "Use speaker", tint = Color.White) },
                             )
                             FloatingActionButton(
-                                onClick = onHangUp,
+                                onClick = {
+                                    revealControls()
+                                    onToggleFullscreen(!isFullscreen)
+                                },
+                                containerColor = Color(0xCC102336),
+                                shape = CircleShape,
+                            ) {
+                                Icon(
+                                    imageVector = if (isFullscreen) Icons.Rounded.FullscreenExit else Icons.Rounded.Fullscreen,
+                                    contentDescription = if (isFullscreen) "Exit fullscreen" else "Enter fullscreen",
+                                    tint = Color.White,
+                                )
+                            }
+                            FloatingActionButton(
+                                onClick = {
+                                    revealControls()
+                                    if (isFullscreen) {
+                                        onToggleFullscreen(false)
+                                    }
+                                    onHangUp()
+                                },
                                 containerColor = Color(0xFFFF6B6B),
                                 shape = CircleShape,
                             ) {
@@ -180,22 +271,24 @@ fun DropInScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(
-                text = "Available on your local network",
-                style = MaterialTheme.typography.titleMedium,
-                color = Color.White,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Spacer(modifier = Modifier.height(8.dp))
+            if (!isFullscreen) {
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "Available on your local network",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(modifier = Modifier.height(8.dp))
 
-            LazyColumn(
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = PaddingValues(bottom = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                items(state.devices, key = { it.serviceName }) { peer ->
-                    PeerCard(peer = peer, onConnect = { onConnect(peer) })
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(bottom = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    items(state.devices, key = { it.serviceName }) { peer ->
+                        PeerCard(peer = peer, onConnect = { onConnect(peer) })
+                    }
                 }
             }
         }
