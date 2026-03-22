@@ -68,8 +68,8 @@ class MainActivity : ComponentActivity() {
             ) {
                 val state by viewModel.uiState.collectAsState()
                 LaunchedEffect(state.isInCall) {
-                    if (!state.isInCall && isFullscreen) {
-                        applyFullscreen(false)
+                    if (!state.isInCall) {
+                        exitFullscreenToPortrait()
                     }
                 }
                 DropInScreen(
@@ -151,21 +151,27 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun applyFullscreen(enabled: Boolean) {
-        isFullscreen = enabled
-        requestedOrientation = if (enabled) {
-            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        } else {
-            ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+        if (!enabled) {
+            exitFullscreenToPortrait()
+            return
         }
+        isFullscreen = enabled
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
 
-        WindowCompat.setDecorFitsSystemWindows(window, !enabled)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).apply {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            if (enabled) {
-                hide(WindowInsetsCompat.Type.systemBars())
-            } else {
-                show(WindowInsetsCompat.Type.systemBars())
-            }
+            hide(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    private fun exitFullscreenToPortrait() {
+        isFullscreen = false
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        WindowCompat.setDecorFitsSystemWindows(window, true)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            show(WindowInsetsCompat.Type.systemBars())
         }
     }
 }

@@ -66,7 +66,6 @@ class DropInManager(
     }
 
     fun initializeRenderers(local: SurfaceViewRenderer, remote: SurfaceViewRenderer) {
-        if (localRenderer === local && remoteRenderer === remote) return
         if (localRenderer !== local) {
             localVideoTrack?.removeSink(localRenderer)
         }
@@ -78,8 +77,8 @@ class DropInManager(
 
         initializeRendererIfNeeded(local, isLocal = true, scaling = RendererCommon.ScalingType.SCALE_ASPECT_FILL)
         initializeRendererIfNeeded(remote, isLocal = false, scaling = RendererCommon.ScalingType.SCALE_ASPECT_FIT)
-        localVideoTrack?.addSink(local)
-        remoteVideoTrack?.addSink(remote)
+        rebindLocalVideoSink()
+        rebindRemoteVideoSink()
         setRemotePrimary(true)
     }
 
@@ -94,9 +93,9 @@ class DropInManager(
         localVideoTrack = peerFactory.createVideoTrack("localVideo", videoSource)
         localAudioTrack = peerFactory.createAudioTrack("localAudio", audioSource)
 
-        videoCapturer?.initialize(surfaceTextureHelper, localRenderer?.context, videoSource?.capturerObserver)
+        videoCapturer?.initialize(surfaceTextureHelper, appContext, videoSource?.capturerObserver)
         videoCapturer?.startCapture(1280, 720, 30)
-        localVideoTrack?.addSink(localRenderer)
+        rebindLocalVideoSink()
     }
 
     fun createPeerConnection(onConnected: () -> Unit) {
@@ -148,8 +147,8 @@ class DropInManager(
 
         localVideoTrack?.setEnabled(true)
         localAudioTrack?.setEnabled(true)
-        peerConnection?.addTrack(localVideoTrack, listOf("stream"))
-        peerConnection?.addTrack(localAudioTrack, listOf("stream"))
+        localVideoTrack?.let { peerConnection?.addTrack(it, listOf("stream")) }
+        localAudioTrack?.let { peerConnection?.addTrack(it, listOf("stream")) }
     }
 
     fun createOffer(onCreated: (SessionDescription) -> Unit) {
@@ -242,10 +241,25 @@ class DropInManager(
     }
 
     private fun attachRemoteVideoTrack(track: VideoTrack) {
+        Log.d(logTag, "attachRemoteVideoTrack rendererReady=${remoteRenderer != null}")
         remoteVideoTrack?.removeSink(remoteRenderer)
         remoteVideoTrack = track
-        track.addSink(remoteRenderer)
+        rebindRemoteVideoSink()
         onRemoteVideoReady()
+    }
+
+    private fun rebindLocalVideoSink() {
+        val renderer = localRenderer ?: return
+        val track = localVideoTrack ?: return
+        track.removeSink(renderer)
+        track.addSink(renderer)
+    }
+
+    private fun rebindRemoteVideoSink() {
+        val renderer = remoteRenderer ?: return
+        val track = remoteVideoTrack ?: return
+        track.removeSink(renderer)
+        track.addSink(renderer)
     }
 
     private fun initializeRendererIfNeeded(

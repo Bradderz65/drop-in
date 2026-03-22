@@ -150,8 +150,13 @@ class DropInViewModel(
 
     fun hangUp() {
         Log.d(logTag, "hangUp tapped selectedPeer=${_uiState.value.selectedPeer?.displayName} isInCall=${_uiState.value.isInCall}")
-        signalingClient.send(SignalEnvelope(type = SignalType.HANGUP, from = deviceName))
-        runtime.sendLocal(SignalEnvelope(type = SignalType.HANGUP, from = deviceName))
+        val hangup = SignalEnvelope(
+            type = SignalType.HANGUP,
+            from = deviceName,
+            to = _uiState.value.selectedPeer?.serviceName,
+        )
+        signalingClient.send(hangup)
+        runtime.sendLocal(hangup)
         signalingClient.disconnect()
         dropInManager.endCall()
         connectTimeoutJob?.cancel()
@@ -237,23 +242,30 @@ class DropInViewModel(
         )
 
         dropInManager.endCall()
+        signalingClient.disconnect()
+        if (peer.host.isNotBlank()) {
+            signalingClient.connect(peer.host, peer.port)
+        } else {
+            Log.w(logTag, "handleOffer no peer host available for direct signaling response")
+        }
         dropInManager.createPeerConnection {
             connectTimeoutJob?.cancel()
             _uiState.value = _uiState.value.copy(isInCall = true, status = "Connected to ${peer.displayName}")
         }
         val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, signal.sdp.orEmpty())
         dropInManager.setRemoteDescription(remoteOffer) {
+            ensureLocalMediaReady()
             dropInManager.createAnswer { answer ->
                 Log.d(logTag, "sending answer to=${peer.serviceName}")
-                runtime.sendLocal(
-                    SignalEnvelope(
-                        type = SignalType.ANSWER,
-                        from = deviceName,
-                        to = peer.serviceName,
-                        sdp = answer.description,
-                        sdpType = answer.type.canonicalForm(),
-                    ),
+                val response = SignalEnvelope(
+                    type = SignalType.ANSWER,
+                    from = deviceName,
+                    to = peer.serviceName,
+                    sdp = answer.description,
+                    sdpType = answer.type.canonicalForm(),
                 )
+                signalingClient.send(response)
+                runtime.sendLocal(response)
             }
         }
     }
@@ -327,5 +339,9 @@ class DropInViewModel(
         SessionDescription.Type.ANSWER -> "answer"
         SessionDescription.Type.PRANSWER -> "pranswer"
         SessionDescription.Type.ROLLBACK -> "rollback"
+    }
+
+    private fun ensureLocalMediaReady() {
+        dropInManager.startLocalMedia()
     }
 }
