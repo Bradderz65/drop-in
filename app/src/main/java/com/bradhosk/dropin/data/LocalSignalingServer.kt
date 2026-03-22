@@ -1,5 +1,6 @@
 package com.bradhosk.dropin.data
 
+import android.util.Log
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoWSD
 import fi.iki.elonen.NanoHTTPD.IHTTPSession
@@ -12,6 +13,7 @@ import java.io.IOException
 class LocalSignalingServer(
     private val json: Json = Json { ignoreUnknownKeys = true },
 ) {
+    private val logTag = "DropInApp"
     private val _events = MutableSharedFlow<SignalEnvelope>(extraBufferCapacity = 32)
     private var webSocket: SignalingSocket? = null
     private var server: SignalingWsd? = null
@@ -22,6 +24,7 @@ class LocalSignalingServer(
 
     fun start(preferredPort: Int = 8989) {
         if (server != null) return
+        Log.d(logTag, "local signaling server start port=$preferredPort")
         server = SignalingWsd(preferredPort).also { it.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false) }
     }
 
@@ -33,6 +36,7 @@ class LocalSignalingServer(
     }
 
     fun send(message: SignalEnvelope) {
+        Log.d(logTag, "local signaling send type=${message.type} to=${message.to}")
         runCatching {
             webSocket?.send(json.encodeToString(SignalEnvelope.serializer(), message))
         }
@@ -41,6 +45,7 @@ class LocalSignalingServer(
     private inner class SignalingWsd(port: Int) : NanoWSD(port) {
         @Throws(IOException::class)
         override fun openWebSocket(handshake: IHTTPSession): WebSocket {
+            Log.d(logTag, "local signaling socket opened from=${handshake.remoteIpAddress}")
             return SignalingSocket(handshake).also { socket ->
                 webSocket = socket
             }
@@ -52,9 +57,12 @@ class LocalSignalingServer(
     }
 
     private inner class SignalingSocket(handshakeRequest: IHTTPSession) : NanoWSD.WebSocket(handshakeRequest) {
-        override fun onOpen() = Unit
+        override fun onOpen() {
+            Log.d(logTag, "local signaling websocket onOpen")
+        }
 
         override fun onClose(code: WebSocketFrame.CloseCode?, reason: String?, initiatedByRemote: Boolean) {
+            Log.d(logTag, "local signaling websocket onClose code=$code reason=$reason initiatedByRemote=$initiatedByRemote")
             webSocket = null
         }
 
@@ -62,11 +70,14 @@ class LocalSignalingServer(
             runCatching {
                 json.decodeFromString(SignalEnvelope.serializer(), message.textPayload)
             }.onSuccess { decoded ->
+                Log.d(logTag, "local signaling receive type=${decoded.type} from=${decoded.from} to=${decoded.to}")
                 _events.tryEmit(decoded)
             }
         }
 
         override fun onPong(pong: WebSocketFrame) = Unit
-        override fun onException(exception: IOException) = Unit
+        override fun onException(exception: IOException) {
+            Log.e(logTag, "local signaling websocket exception", exception)
+        }
     }
 }

@@ -8,10 +8,13 @@ import com.bradhosk.dropin.data.IceCandidatePayload
 import com.bradhosk.dropin.data.LocalSignalingServer
 import com.bradhosk.dropin.data.NsdPeerDiscovery
 import com.bradhosk.dropin.data.PeerSignalingClient
+import com.bradhosk.dropin.data.PeerSignalingStatus
 import com.bradhosk.dropin.data.SignalEnvelope
 import com.bradhosk.dropin.data.SignalType
 import com.bradhosk.dropin.model.PeerDevice
 import com.bradhosk.dropin.webrtc.DropInManager
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -29,6 +32,9 @@ data class DropInUiState(
     val isInCall: Boolean = false,
     val isMicOn: Boolean = true,
     val isCameraOn: Boolean = true,
+    val isSpeakerOn: Boolean = true,
+    val isUsingFrontCamera: Boolean = true,
+    val isRemotePrimary: Boolean = true,
     val status: String = "Searching for local devices",
 )
 
@@ -41,6 +47,7 @@ class DropInViewModel(
     private val signalingClient = PeerSignalingClient()
     private val peerDiscovery = NsdPeerDiscovery(application, deviceName)
     val dropInManager = DropInManager(application)
+    private var connectTimeoutJob: Job? = null
 
     private val _uiState = MutableStateFlow(
         DropInUiState(deviceName = deviceName.removePrefix("dropin-")),
@@ -54,7 +61,7 @@ class DropInViewModel(
     )
 
     init {
-        dropInManager.onIceCandidate = { candidate ->
+        dropInManager.onIceCandidateDiscovered = { candidate ->
             _uiState.value.selectedPeer?.let { peer ->
                 signalingClient.send(candidate.toSignalEnvelope(peer.serviceName))
                 signalingServer.send(candidate.toSignalEnvelope(peer.serviceName))
@@ -66,7 +73,19 @@ class DropInViewModel(
 
         viewModelScope.launch {
             peerDiscovery.peers.collect { devices ->
-                _uiState.value = _uiState.value.copy(devices = devices)
+                val manualDevices = listOf(
+                    PeerDevice(
+                        serviceName = "dropin-PC-Test",
+                        displayName = "PC Test",
+                        host = "192.168.0.19",
+                        port = 8989,
+                    ),
+                )
+                _uiState.value = _uiState.value.copy(
+                    devices = (manualDevices + devices)
+                        .distinctBy { it.serviceName }
+                        .sortedBy { it.displayName.lowercase() },
+                )
             }
         }
 
@@ -76,6 +95,10 @@ class DropInViewModel(
 
         viewModelScope.launch {
             signalingClient.events.collect(::handleSignal)
+        }
+
+        viewModelScope.launch {
+            signalingClient.status.collect(::handleSignalingStatus)
         }
     }
 
@@ -107,6 +130,19 @@ class DropInViewModel(
                 ),
             )
         }
+        connectTimeoutJob?.cancel()
+        connectTimeoutJob = viewModelScope.launch {
+            delay(8_000)
+            if (!_uiState.value.isInCall && _uiState.value.selectedPeer?.serviceName == peer.serviceName) {
+                Log.w(logTag, "connect timeout peer=${peer.displayName}")
+                signalingClient.disconnect()
+                dropInManager.endCall()
+                _uiState.value = _uiState.value.copy(
+                    selectedPeer = null,
+                    status = "Could not connect to ${peer.displayName}",
+                )
+            }
+        }
     }
 
     fun hangUp() {
@@ -115,9 +151,11 @@ class DropInViewModel(
         signalingServer.send(SignalEnvelope(type = SignalType.HANGUP, from = deviceName))
         signalingClient.disconnect()
         dropInManager.endCall()
+        connectTimeoutJob?.cancel()
         _uiState.value = _uiState.value.copy(
             selectedPeer = null,
             isInCall = false,
+            isSpeakerOn = true,
             status = "Ready for drop in",
         )
     }
@@ -132,6 +170,23 @@ class DropInViewModel(
         _uiState.value = _uiState.value.copy(isCameraOn = enabled)
     }
 
+    fun setSpeakerEnabled(enabled: Boolean) {
+        dropInManager.toggleSpeaker(enabled)
+        _uiState.value = _uiState.value.copy(isSpeakerOn = enabled)
+    }
+
+    fun switchCamera() {
+        dropInManager.switchCamera { isFrontCamera ->
+            _uiState.value = _uiState.value.copy(isUsingFrontCamera = isFrontCamera)
+        }
+    }
+
+    fun swapVideoViews() {
+        val remotePrimary = !_uiState.value.isRemotePrimary
+        dropInManager.setRemotePrimary(remotePrimary)
+        _uiState.value = _uiState.value.copy(isRemotePrimary = remotePrimary)
+    }
+
     private fun handleSignal(signal: SignalEnvelope) {
         Log.d(logTag, "handleSignal type=${signal.type} from=${signal.from} to=${signal.to}")
         when (signal.type) {
@@ -141,23 +196,38 @@ class DropInViewModel(
             SignalType.HANGUP -> {
                 signalingClient.disconnect()
                 dropInManager.endCall()
-                _uiState.value = _uiState.value.copy(isInCall = false, selectedPeer = null, status = "Call ended")
+                connectTimeoutJob?.cancel()
+                _uiState.value = _uiState.value.copy(
+                    isInCall = false,
+                    isSpeakerOn = true,
+                    selectedPeer = null,
+                    status = "Call ended",
+                )
             }
         }
     }
 
     private fun handleOffer(signal: SignalEnvelope) {
-        val peer = peers.value.firstOrNull { it.serviceName == signal.from } ?: return
+        val peer = peers.value.firstOrNull { it.serviceName == signal.from } ?: PeerDevice(
+            serviceName = signal.from,
+            displayName = signal.from.removePrefix("dropin-"),
+            host = _uiState.value.selectedPeer?.host.orEmpty(),
+            port = _uiState.value.selectedPeer?.port ?: 8989,
+        ).also {
+            Log.w(logTag, "handleOffer using fallback peer serviceName=${signal.from}; knownPeers=${peers.value.map { known -> known.serviceName }}")
+        }
         Log.d(logTag, "handleOffer peer=${peer.displayName}")
         _uiState.value = _uiState.value.copy(selectedPeer = peer, status = "Incoming drop in from ${peer.displayName}")
 
         dropInManager.endCall()
         dropInManager.createPeerConnection {
+            connectTimeoutJob?.cancel()
             _uiState.value = _uiState.value.copy(isInCall = true, status = "Connected to ${peer.displayName}")
         }
         val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, signal.sdp.orEmpty())
         dropInManager.setRemoteDescription(remoteOffer) {
             dropInManager.createAnswer { answer ->
+                Log.d(logTag, "sending answer to=${peer.serviceName}")
                 signalingServer.send(
                     SignalEnvelope(
                         type = SignalType.ANSWER,
@@ -173,6 +243,7 @@ class DropInViewModel(
 
     private fun handleAnswer(signal: SignalEnvelope) {
         Log.d(logTag, "handleAnswer from=${signal.from}")
+        connectTimeoutJob?.cancel()
         val description = SessionDescription(SessionDescription.Type.ANSWER, signal.sdp.orEmpty())
         dropInManager.setRemoteDescription(description)
         _uiState.value = _uiState.value.copy(isInCall = true, status = "Call established")
@@ -187,11 +258,37 @@ class DropInViewModel(
     }
 
     override fun onCleared() {
+        connectTimeoutJob?.cancel()
         peerDiscovery.stop()
         signalingClient.disconnect()
         signalingServer.stop()
         dropInManager.release()
         super.onCleared()
+    }
+
+    private fun handleSignalingStatus(status: PeerSignalingStatus) {
+        when (status) {
+            is PeerSignalingStatus.Connecting -> {
+                Log.d(logTag, "signaling status connecting ${status.host}:${status.port}")
+            }
+            PeerSignalingStatus.Connected -> {
+                Log.d(logTag, "signaling status connected")
+            }
+            is PeerSignalingStatus.Closed -> {
+                Log.d(logTag, "signaling status closed code=${status.code} reason=${status.reason}")
+            }
+            is PeerSignalingStatus.Failed -> {
+                Log.w(logTag, "signaling status failed message=${status.message}")
+                if (!_uiState.value.isInCall) {
+                    connectTimeoutJob?.cancel()
+                    dropInManager.endCall()
+                    _uiState.value = _uiState.value.copy(
+                        selectedPeer = null,
+                        status = "Signaling failed: ${status.message}",
+                    )
+                }
+            }
+        }
     }
 
     private fun IceCandidate.toSignalEnvelope(target: String) = SignalEnvelope(

@@ -22,8 +22,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CallEnd
+import androidx.compose.material.icons.rounded.Cameraswitch
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.MicOff
+import androidx.compose.material.icons.rounded.SwapHoriz
+import androidx.compose.material.icons.rounded.VolumeOff
+import androidx.compose.material.icons.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material.icons.rounded.VideocamOff
 import androidx.compose.material3.Button
@@ -41,6 +45,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.bradhosk.dropin.model.PeerDevice
@@ -51,9 +56,12 @@ fun DropInScreen(
     onConnect: (PeerDevice) -> Unit,
     onToggleMic: (Boolean) -> Unit,
     onToggleCamera: (Boolean) -> Unit,
+    onToggleSpeaker: (Boolean) -> Unit,
+    onSwitchCamera: () -> Unit,
+    onSwapViews: () -> Unit,
     onHangUp: () -> Unit,
-    localVideo: @Composable () -> Unit,
-    remoteVideo: @Composable () -> Unit,
+    localVideo: @Composable (Modifier) -> Unit,
+    remoteVideo: @Composable (Modifier) -> Unit,
 ) {
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -88,18 +96,22 @@ fun DropInScreen(
                     .weight(1f)
                     .clip(RoundedCornerShape(28.dp))
                     .background(Color(0xFF13293D)),
-                    ) {
-                remoteVideo()
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(14.dp)
-                        .size(132.dp)
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(Color(0xFF0F1E2A)),
-                ) {
-                    localVideo()
-                }
+            ) {
+                val fullScreenModifier = Modifier
+                    .matchParentSize()
+                    .zIndex(0f)
+                val pipModifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(14.dp)
+                    .size(132.dp)
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(Color(0xFF0F1E2A))
+                    .zIndex(1f)
+                val remoteModifier = if (state.isRemotePrimary) fullScreenModifier else pipModifier
+                val localModifier = if (state.isRemotePrimary) pipModifier else fullScreenModifier
+
+                remoteVideo(remoteModifier)
+                localVideo(localModifier)
 
                 androidx.compose.animation.AnimatedVisibility(
                     modifier = Modifier
@@ -107,28 +119,62 @@ fun DropInScreen(
                         .padding(bottom = 18.dp),
                     visible = state.isInCall,
                 ) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        ToggleFab(
-                            enabled = state.isMicOn,
-                            onClick = { onToggleMic(!state.isMicOn) },
-                            activeIcon = { Icon(Icons.Rounded.Mic, contentDescription = "Mute", tint = Color.White) },
-                            inactiveIcon = { Icon(Icons.Rounded.MicOff, contentDescription = "Unmute", tint = Color.White) },
-                        )
-                        ToggleFab(
-                            enabled = state.isCameraOn,
-                            onClick = { onToggleCamera(!state.isCameraOn) },
-                            activeIcon = { Icon(Icons.Rounded.Videocam, contentDescription = "Disable camera", tint = Color.White) },
-                            inactiveIcon = { Icon(Icons.Rounded.VideocamOff, contentDescription = "Enable camera", tint = Color.White) },
-                        )
-                        FloatingActionButton(
-                            onClick = onHangUp,
-                            containerColor = Color(0xFFFF6B6B),
-                            shape = CircleShape,
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Icon(Icons.Rounded.CallEnd, contentDescription = "Hang up", tint = Color.White)
+                            ToggleFab(
+                                enabled = state.isMicOn,
+                                onClick = { onToggleMic(!state.isMicOn) },
+                                activeIcon = { Icon(Icons.Rounded.Mic, contentDescription = "Mute", tint = Color.White) },
+                                inactiveIcon = { Icon(Icons.Rounded.MicOff, contentDescription = "Unmute", tint = Color.White) },
+                            )
+                            ToggleFab(
+                                enabled = state.isCameraOn,
+                                onClick = { onToggleCamera(!state.isCameraOn) },
+                                activeIcon = { Icon(Icons.Rounded.Videocam, contentDescription = "Disable camera", tint = Color.White) },
+                                inactiveIcon = { Icon(Icons.Rounded.VideocamOff, contentDescription = "Enable camera", tint = Color.White) },
+                            )
+                            FloatingActionButton(
+                                onClick = onSwitchCamera,
+                                containerColor = Color(0xCC102336),
+                                shape = CircleShape,
+                            ) {
+                                Icon(
+                                    Icons.Rounded.Cameraswitch,
+                                    contentDescription = if (state.isUsingFrontCamera) "Switch to back camera" else "Switch to front camera",
+                                    tint = Color.White,
+                                )
+                            }
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            FloatingActionButton(
+                                onClick = onSwapViews,
+                                containerColor = Color(0xCC102336),
+                                shape = CircleShape,
+                            ) {
+                                Icon(Icons.Rounded.SwapHoriz, contentDescription = "Swap video views", tint = Color.White)
+                            }
+                            ToggleFab(
+                                enabled = state.isSpeakerOn,
+                                onClick = { onToggleSpeaker(!state.isSpeakerOn) },
+                                activeIcon = { Icon(Icons.Rounded.VolumeUp, contentDescription = "Use earpiece", tint = Color.White) },
+                                inactiveIcon = { Icon(Icons.Rounded.VolumeOff, contentDescription = "Use speaker", tint = Color.White) },
+                            )
+                            FloatingActionButton(
+                                onClick = onHangUp,
+                                containerColor = Color(0xFFFF6B6B),
+                                shape = CircleShape,
+                            ) {
+                                Icon(Icons.Rounded.CallEnd, contentDescription = "Hang up", tint = Color.White)
+                            }
                         }
                     }
                 }

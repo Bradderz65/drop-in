@@ -1,5 +1,9 @@
 package com.bradhosk.dropin.webrtc
 
+import android.content.Context.AUDIO_SERVICE
+import android.os.Build
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.content.Context
 import android.util.Log
 import org.webrtc.AudioSource
@@ -11,6 +15,7 @@ import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
+import org.webrtc.CameraVideoCapturer.CameraSwitchHandler
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RendererCommon
@@ -25,6 +30,7 @@ class DropInManager(
 ) {
     private val logTag = "DropInApp"
     private val appContext = context.applicationContext
+    private val audioManager = appContext.getSystemService(AUDIO_SERVICE) as AudioManager
     private val eglBase = EglBase.create()
     private val peerFactory: PeerConnectionFactory
     private var peerConnection: PeerConnection? = null
@@ -35,8 +41,14 @@ class DropInManager(
     private var localAudioTrack: AudioTrack? = null
     private var remoteRenderer: SurfaceViewRenderer? = null
     private var localRenderer: SurfaceViewRenderer? = null
+    private var remoteVideoTrack: VideoTrack? = null
+    private var isUsingFrontCamera = true
+    private var previousAudioMode: Int = audioManager.mode
+    private var previousSpeakerphoneState: Boolean = audioManager.isSpeakerphoneOn
+    private var audioRouteInitialized = false
+    private var speakerEnabled = true
 
-    var onIceCandidate: (IceCandidate) -> Unit = {}
+    var onIceCandidateDiscovered: (IceCandidate) -> Unit = {}
     var onRemoteVideoReady: () -> Unit = {}
 
     init {
@@ -60,9 +72,10 @@ class DropInManager(
             .forEach { (renderer, scaling) ->
                 renderer.init(eglBase.eglBaseContext, null)
                 renderer.setScalingType(scaling)
-                renderer.setMirror(renderer === local)
+                renderer.setMirror(renderer === local && isUsingFrontCamera)
                 renderer.setEnableHardwareScaler(true)
             }
+        setRemotePrimary(true)
     }
 
     fun startLocalMedia() {
@@ -84,6 +97,7 @@ class DropInManager(
     fun createPeerConnection(onConnected: () -> Unit) {
         Log.d(logTag, "createPeerConnection existing=${peerConnection != null}")
         if (peerConnection != null) return
+        configureAudioRoute(useSpeaker = true)
         val rtcConfig = PeerConnection.RTCConfiguration(
             listOf(
                 PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
@@ -94,13 +108,13 @@ class DropInManager(
             object : PeerConnection.Observer {
                 override fun onIceCandidate(candidate: IceCandidate) {
                     Log.d(logTag, "onIceCandidate")
-                    onIceCandidate(candidate)
+                    onIceCandidateDiscovered(candidate)
                 }
 
                 override fun onTrack(transceiver: org.webrtc.RtpTransceiver?) {
                     val track = transceiver?.receiver?.track() as? VideoTrack ?: return
-                    track.addSink(remoteRenderer)
-                    onRemoteVideoReady()
+                    Log.d(logTag, "onTrack remote video")
+                    attachRemoteVideoTrack(track)
                 }
 
                 override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
@@ -115,7 +129,11 @@ class DropInManager(
                 override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
                 override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) = Unit
                 override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate?>?) = Unit
-                override fun onAddStream(stream: org.webrtc.MediaStream?) = Unit
+                override fun onAddStream(stream: org.webrtc.MediaStream?) {
+                    val track = stream?.videoTracks?.firstOrNull() ?: return
+                    Log.d(logTag, "onAddStream remote video")
+                    attachRemoteVideoTrack(track)
+                }
                 override fun onRemoveStream(stream: org.webrtc.MediaStream?) = Unit
                 override fun onDataChannel(dataChannel: org.webrtc.DataChannel?) = Unit
                 override fun onRenegotiationNeeded() = Unit
@@ -169,6 +187,33 @@ class DropInManager(
         localVideoTrack?.setEnabled(enabled)
     }
 
+    fun toggleSpeaker(enabled: Boolean) {
+        Log.d(logTag, "toggleSpeaker enabled=$enabled")
+        speakerEnabled = enabled
+        configureAudioRoute(useSpeaker = enabled)
+    }
+
+    fun setRemotePrimary(remotePrimary: Boolean) {
+        remoteRenderer?.setZOrderMediaOverlay(!remotePrimary)
+        localRenderer?.setZOrderMediaOverlay(remotePrimary)
+    }
+
+    fun switchCamera(onSwitched: (Boolean) -> Unit) {
+        val capturer = videoCapturer ?: return
+        capturer.switchCamera(object : CameraSwitchHandler {
+            override fun onCameraSwitchDone(isFrontCamera: Boolean) {
+                Log.d(logTag, "switchCamera done isFrontCamera=$isFrontCamera")
+                isUsingFrontCamera = isFrontCamera
+                localRenderer?.setMirror(isFrontCamera)
+                onSwitched(isFrontCamera)
+            }
+
+            override fun onCameraSwitchError(errorDescription: String?) {
+                Log.w(logTag, "switchCamera error=$errorDescription")
+            }
+        })
+    }
+
     fun release() {
         endCall()
         stopLocalMedia()
@@ -181,9 +226,62 @@ class DropInManager(
 
     fun endCall() {
         Log.d(logTag, "endCall")
+        remoteVideoTrack?.removeSink(remoteRenderer)
+        remoteVideoTrack = null
         peerConnection?.close()
         peerConnection?.dispose()
         peerConnection = null
+        restoreAudioRoute()
+    }
+
+    private fun attachRemoteVideoTrack(track: VideoTrack) {
+        remoteVideoTrack?.removeSink(remoteRenderer)
+        remoteVideoTrack = track
+        track.addSink(remoteRenderer)
+        onRemoteVideoReady()
+    }
+
+    private fun configureAudioRoute(useSpeaker: Boolean) {
+        if (!audioRouteInitialized) {
+            previousAudioMode = audioManager.mode
+            previousSpeakerphoneState = audioManager.isSpeakerphoneOn
+            audioRouteInitialized = true
+        }
+        speakerEnabled = useSpeaker
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        audioManager.isSpeakerphoneOn = useSpeaker
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val targetType = if (useSpeaker) {
+                AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            } else {
+                AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            }
+            val targetDevice = audioManager.availableCommunicationDevices
+                .firstOrNull { it.type == targetType }
+                ?: if (!useSpeaker) {
+                    audioManager.availableCommunicationDevices.firstOrNull {
+                        it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                    }
+                } else {
+                    null
+                }
+            if (targetDevice != null) {
+                Log.d(logTag, "configureAudioRoute device=${targetDevice.productName} type=${targetDevice.type}")
+                audioManager.setCommunicationDevice(targetDevice)
+            } else {
+                Log.w(logTag, "configureAudioRoute no target communication device for useSpeaker=$useSpeaker")
+            }
+        }
+    }
+
+    private fun restoreAudioRoute() {
+        if (!audioRouteInitialized) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.clearCommunicationDevice()
+        }
+        audioManager.isSpeakerphoneOn = previousSpeakerphoneState
+        audioManager.mode = previousAudioMode
+        audioRouteInitialized = false
     }
 
     private fun stopLocalMedia() {
@@ -207,7 +305,10 @@ class DropInManager(
         val frontCamera = deviceNames.firstOrNull(enumerator::isFrontFacing)
         val backCamera = deviceNames.firstOrNull(enumerator::isBackFacing)
 
-        return listOfNotNull(frontCamera, backCamera).firstNotNullOfOrNull { name ->
+        return listOfNotNull(
+            if (isUsingFrontCamera) frontCamera else backCamera,
+            if (isUsingFrontCamera) backCamera else frontCamera,
+        ).firstNotNullOfOrNull { name ->
             enumerator.createCapturer(name, null)
         }
     }

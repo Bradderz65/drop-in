@@ -1,0 +1,3 @@
+aiohttp==3.11.13
+aiortc==1.10.1
+zeroconf==0.146.3

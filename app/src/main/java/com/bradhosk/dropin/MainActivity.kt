@@ -14,6 +14,8 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import com.bradhosk.dropin.ui.DropInScreen
@@ -48,9 +50,12 @@ class MainActivity : ComponentActivity() {
                     onConnect = viewModel::connectToPeer,
                     onToggleMic = viewModel::setMicEnabled,
                     onToggleCamera = viewModel::setCameraEnabled,
+                    onToggleSpeaker = viewModel::setSpeakerEnabled,
+                    onSwitchCamera = viewModel::switchCamera,
+                    onSwapViews = viewModel::swapVideoViews,
                     onHangUp = viewModel::hangUp,
-                    localVideo = { VideoRenderer { renderer -> onLocalRendererCreated(renderer) } },
-                    remoteVideo = { VideoRenderer { renderer -> onRemoteRendererCreated(renderer) } },
+                    localVideo = { modifier -> VideoRenderer("local", modifier) { renderer -> onLocalRendererCreated(renderer) } },
+                    remoteVideo = { modifier -> VideoRenderer("remote", modifier) { renderer -> onRemoteRendererCreated(renderer) } },
                 )
             }
         }
@@ -77,13 +82,18 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun VideoRenderer(
+        tag: String,
+        modifier: Modifier,
         onRendererCreated: (SurfaceViewRenderer) -> Unit,
     ) {
+        val context = LocalContext.current
+        val renderer = remember(tag) {
+            SurfaceViewRenderer(context).also(onRendererCreated)
+        }
         AndroidView(
-            modifier = Modifier.fillMaxSize(),
-            factory = { context ->
-                SurfaceViewRenderer(context).also(onRendererCreated)
-            },
+            modifier = modifier,
+            factory = { renderer },
+            update = { onRendererCreated(it) },
         )
     }
 
