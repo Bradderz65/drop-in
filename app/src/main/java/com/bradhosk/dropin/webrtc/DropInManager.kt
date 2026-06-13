@@ -519,18 +519,16 @@ class DropInManager(
         val sender = videoSender() ?: return
         val profile = outboundProfile
         val parameters = sender.parameters
-        val encodings = parameters.encodings?.toMutableList() ?: mutableListOf()
-        if (encodings.isEmpty()) {
-            encodings.add(RtpParameters.Encoding(VIDEO_ENCODING_ID, true, 1.0))
+        val encoding = parameters.encodings?.firstOrNull()
+        if (encoding == null) {
+            Log.d(logTag, "applyOutboundEncoding skipped; no encodings yet")
+            return
         }
-        encodings[0] = encodings[0].apply {
-            active = true
-            maxBitrateBps = profile.maxBitrateBps
-            minBitrateBps = profile.minBitrateBps
-            maxFramerate = profile.captureFps
-            scaleResolutionDownBy = 1.0
-        }
-        parameters.encodings = encodings
+        encoding.active = true
+        encoding.maxBitrateBps = profile.maxBitrateBps
+        encoding.minBitrateBps = profile.minBitrateBps
+        encoding.maxFramerate = profile.captureFps
+        encoding.scaleResolutionDownBy = 1.0
         parameters.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
         if (!sender.setParameters(parameters)) {
             Log.w(logTag, "applyOutboundEncoding setParameters failed")
@@ -565,7 +563,6 @@ class DropInManager(
 
     companion object {
         private const val CONNECTION_LOST_GRACE_MS = 8_000L
-        private const val VIDEO_ENCODING_ID = "dropin-video"
     }
 
     private open class SdpAdapter : org.webrtc.SdpObserver {
