@@ -114,13 +114,7 @@ class DropInBackgroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(logTag, "background service onStartCommand flags=$flags startId=$startId")
         enterForeground()
-        return START_STICKY
-    }
-
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.d(logTag, "background service onTaskRemoved")
-        start(this)
-        super.onTaskRemoved(rootIntent)
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {

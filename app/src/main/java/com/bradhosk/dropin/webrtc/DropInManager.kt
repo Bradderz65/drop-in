@@ -42,6 +42,8 @@ class DropInManager(
     private val peerFactory: PeerConnectionFactory
     private var peerConnection: PeerConnection? = null
     private var videoCapturer: CameraVideoCapturer? = null
+    private var surfaceTextureHelper: SurfaceTextureHelper? = null
+    private var activeCaptureProfile: VideoQualityProfile? = null
     private var videoSource: VideoSource? = null
     private var audioSource: AudioSource? = null
     private var localVideoTrack: VideoTrack? = null
@@ -138,24 +140,20 @@ class DropInManager(
             return false
         }
 
-        val surfaceTextureHelper = SurfaceTextureHelper.create("DropInCaptureThread", eglBase.eglBaseContext)
+        val helper = SurfaceTextureHelper.create("DropInCaptureThread", eglBase.eglBaseContext)
+        surfaceTextureHelper = helper
         videoCapturer = capturer
         videoSource = peerFactory.createVideoSource(false)
         localVideoTrack = peerFactory.createVideoTrack("localVideo", videoSource)
 
         val profile = outboundProfile
         runCatching {
-            capturer.initialize(surfaceTextureHelper, appContext, videoSource?.capturerObserver)
+            capturer.initialize(helper, appContext, videoSource?.capturerObserver)
             capturer.startCapture(profile.captureWidth, profile.captureHeight, profile.captureFps)
+            activeCaptureProfile = profile
         }.onFailure { error ->
             Log.w(logTag, "startLocalMedia camera capture failed; continuing audio-only", error)
-            localVideoTrack?.dispose()
-            localVideoTrack = null
-            videoSource?.dispose()
-            videoSource = null
-            videoCapturer?.dispose()
-            videoCapturer = null
-            surfaceTextureHelper.dispose()
+            releaseVideoCaptureResources()
         }
         rebindLocalVideoSink()
         return localVideoTrack != null
@@ -322,11 +320,17 @@ class DropInManager(
     fun release() {
         endCall()
         stopLocalMedia()
+        detachRenderers()
+        eglBase.release()
+    }
+
+    fun detachRenderers() {
+        localVideoTrack?.removeSink(localRenderer)
+        remoteVideoTrack?.removeSink(remoteRenderer)
         initializedLocalRenderer = null
         initializedRemoteRenderer = null
         localRenderer = null
         remoteRenderer = null
-        eglBase.release()
     }
 
     fun endCall() {
@@ -448,17 +452,26 @@ class DropInManager(
     }
 
     private fun stopLocalMedia() {
+        releaseVideoCaptureResources()
+        localAudioTrack?.dispose()
+        localAudioTrack = null
+        audioSource?.dispose()
+        audioSource = null
+    }
+
+    private fun releaseVideoCaptureResources() {
+        localVideoTrack?.removeSink(localRenderer)
         runCatching { videoCapturer?.stopCapture() }
+            .onFailure { error -> Log.w(logTag, "stopCapture failed", error) }
         videoCapturer?.dispose()
         videoCapturer = null
         localVideoTrack?.dispose()
         localVideoTrack = null
-        localAudioTrack?.dispose()
-        localAudioTrack = null
         videoSource?.dispose()
         videoSource = null
-        audioSource?.dispose()
-        audioSource = null
+        surfaceTextureHelper?.dispose()
+        surfaceTextureHelper = null
+        activeCaptureProfile = null
     }
 
     private fun scheduleConnectionLostCheck() {
@@ -489,14 +502,16 @@ class DropInManager(
     private fun reconfigureCaptureIfNeeded() {
         val capturer = videoCapturer ?: return
         val profile = outboundProfile
+        if (activeCaptureProfile == profile) return
         runCatching {
             capturer.changeCaptureFormat(profile.captureWidth, profile.captureHeight, profile.captureFps)
+            activeCaptureProfile = profile
             Log.d(
                 logTag,
                 "reconfigureCapture ${profile.captureWidth}x${profile.captureHeight}@${profile.captureFps}",
             )
         }.onFailure { error ->
-            Log.w(logTag, "reconfigureCapture failed", error)
+            Log.w(logTag, "reconfigureCapture failed; keeping previous capture profile=$activeCaptureProfile", error)
         }
     }
 

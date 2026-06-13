@@ -23,6 +23,7 @@ class PeerSignalingClient(
 
     private val _events = MutableSharedFlow<SignalEnvelope>(extraBufferCapacity = 32)
     private val _status = MutableSharedFlow<PeerSignalingStatus>(extraBufferCapacity = 16)
+    private val lock = Any()
     private var socket: WebSocket? = null
     private val pendingMessages = ArrayDeque<String>()
     private var isConnected = false
@@ -31,8 +32,10 @@ class PeerSignalingClient(
     val status = _status.asSharedFlow()
 
     fun connect(host: String, port: Int) {
-        if (socket != null) return
-        isConnected = false
+        synchronized(lock) {
+            if (socket != null) return
+            isConnected = false
+        }
         val request = Request.Builder()
             .url("ws://$host:$port")
             .build()
@@ -44,11 +47,17 @@ class PeerSignalingClient(
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     Log.d(logTag, "signaling open")
-                    isConnected = true
-                    _status.tryEmit(PeerSignalingStatus.Connected)
-                    while (pendingMessages.isNotEmpty()) {
-                        webSocket.send(pendingMessages.removeFirst())
+                    val messagesToSend = synchronized(lock) {
+                        if (socket !== webSocket) return@synchronized emptyList<String>()
+                        isConnected = true
+                        buildList {
+                            while (pendingMessages.isNotEmpty()) {
+                                add(pendingMessages.removeFirst())
+                            }
+                        }
                     }
+                    _status.tryEmit(PeerSignalingStatus.Connected)
+                    messagesToSend.forEach(webSocket::send)
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
@@ -63,15 +72,23 @@ class PeerSignalingClient(
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     Log.d(logTag, "signaling closed code=$code reason=$reason")
-                    isConnected = false
-                    socket = null
+                    synchronized(lock) {
+                        if (socket === webSocket) {
+                            isConnected = false
+                            socket = null
+                        }
+                    }
                     _status.tryEmit(PeerSignalingStatus.Closed(code, reason))
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     Log.e(logTag, "signaling failure", t)
-                    isConnected = false
-                    socket = null
+                    synchronized(lock) {
+                        if (socket === webSocket) {
+                            isConnected = false
+                            socket = null
+                        }
+                    }
                     _status.tryEmit(PeerSignalingStatus.Failed(t.message ?: "Unknown signaling error"))
                 }
             },
@@ -80,20 +97,29 @@ class PeerSignalingClient(
 
     fun send(message: SignalEnvelope) {
         val encoded = json.encodeToString(SignalEnvelope.serializer(), message)
-        if (isConnected) {
-            socket?.send(encoded)
+        val activeSocket = synchronized(lock) {
+            if (isConnected) {
+                socket
+            } else {
+                pendingMessages.addLast(encoded)
+                null
+            }
+        }
+        if (activeSocket != null) {
+            activeSocket.send(encoded)
             Log.d(logTag, "signaling send type=${message.type}")
         } else {
-            pendingMessages.addLast(encoded)
             Log.d(logTag, "signaling queue type=${message.type}")
         }
     }
 
     fun disconnect() {
-        pendingMessages.clear()
-        isConnected = false
-        socket?.close(1000, "bye")
-        socket = null
+        val socketToClose = synchronized(lock) {
+            pendingMessages.clear()
+            isConnected = false
+            socket.also { socket = null }
+        }
+        socketToClose?.close(1000, "bye")
     }
 }
 

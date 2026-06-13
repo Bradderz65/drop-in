@@ -110,6 +110,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         if (::videoHost.isInitialized) {
+            viewModel.dropInManager.detachRenderers()
             videoHost.release()
         }
         super.onDestroy()

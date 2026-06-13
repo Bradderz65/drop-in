@@ -122,10 +122,6 @@ class NsdPeerDiscovery(
     }
 
     private fun NsdServiceInfo.readDeviceClassAttribute(): String? {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            return attributes[ATTR_DEVICE_CLASS]?.toString()
-        }
-        @Suppress("DEPRECATION")
         val raw = attributes?.get(ATTR_DEVICE_CLASS) ?: return null
         return String(raw, StandardCharsets.UTF_8)
     }
