@@ -18,6 +18,7 @@ class PeerSignalingClient(
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(15, TimeUnit.SECONDS)
         .build()
 
     private val _events = MutableSharedFlow<SignalEnvelope>(extraBufferCapacity = 32)

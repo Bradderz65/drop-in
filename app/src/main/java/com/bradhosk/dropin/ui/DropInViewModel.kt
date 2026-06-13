@@ -11,6 +11,7 @@ import com.bradhosk.dropin.data.PeerSignalingClient
 import com.bradhosk.dropin.data.PeerSignalingStatus
 import com.bradhosk.dropin.data.SignalEnvelope
 import com.bradhosk.dropin.data.SignalType
+import com.bradhosk.dropin.effectiveDeviceClass
 import com.bradhosk.dropin.model.PeerDevice
 import com.bradhosk.dropin.webrtc.DropInManager
 import kotlinx.coroutines.Job
@@ -31,6 +32,8 @@ data class DropInUiState(
     val deviceName: String,
     val devices: List<PeerDevice> = emptyList(),
     val savedTailnetHost: String = "",
+    val tailnetRegistryUrl: String = "",
+    val localTailscaleAddress: String? = null,
     val selectedPeer: PeerDevice? = null,
     val isInCall: Boolean = false,
     val isMicOn: Boolean = true,
@@ -40,9 +43,6 @@ data class DropInUiState(
     val isRemotePrimary: Boolean = true,
     val hasRemoteVideo: Boolean = false,
     val status: String = "Searching for local devices",
-    // ── New fields ───────────────────────────────────────────
-    val callDurationSeconds: Long = 0,
-    val connectionQuality: ConnectionQuality = ConnectionQuality.UNKNOWN,
     val recentPeers: List<PeerDevice> = emptyList(),
     val isRefreshing: Boolean = false,
 )
@@ -69,6 +69,9 @@ class DropInViewModel(
     )
     val uiState: StateFlow<DropInUiState> = _uiState.asStateFlow()
 
+    private val _callMetrics = MutableStateFlow(CallMetrics())
+    val callMetrics: StateFlow<CallMetrics> = _callMetrics.asStateFlow()
+
     val peers = runtime.peers.stateIn(
         viewModelScope,
         SharingStarted.WhileSubscribed(5_000),
@@ -79,11 +82,21 @@ class DropInViewModel(
         runtime.start()
         dropInManager.onRemoteVideoReady = {
             _uiState.value = _uiState.value.copy(hasRemoteVideo = true)
+            dropInManager.rebindVideoSinks()
         }
         dropInManager.onIceCandidateDiscovered = { candidate ->
             _uiState.value.selectedPeer?.let { peer ->
                 signalingClient.send(candidate.toSignalEnvelope(peer.serviceName))
                 runtime.sendLocal(candidate.toSignalEnvelope(peer.serviceName))
+            }
+        }
+        dropInManager.onConnectionLost = {
+            viewModelScope.launch {
+                if (_uiState.value.isInCall) {
+                    Log.w(logTag, "connection lost; ending call")
+                    hangUp(notifyPeer = false)
+                    _uiState.value = _uiState.value.copy(status = "Connection lost")
+                }
             }
         }
 
@@ -98,6 +111,14 @@ class DropInViewModel(
                 _uiState.value = _uiState.value.copy(savedTailnetHost = host)
             }
         }
+
+        viewModelScope.launch {
+            runtime.tailnetRegistryUrl.collect { url ->
+                _uiState.value = _uiState.value.copy(tailnetRegistryUrl = url)
+            }
+        }
+
+        _uiState.value = _uiState.value.copy(localTailscaleAddress = runtime.localTailscaleAddress())
 
         viewModelScope.launch {
             runtime.signals.collect(::handleSignal)
@@ -121,14 +142,18 @@ class DropInViewModel(
     }
 
     fun startLocalMedia() {
-        dropInManager.startLocalMedia()
-        _uiState.value = _uiState.value.copy(status = "Ready for drop in")
+        val hasLocalCamera = dropInManager.startLocalMedia()
+        _uiState.value = _uiState.value.copy(
+            isCameraOn = hasLocalCamera,
+            status = if (hasLocalCamera) "Ready for drop in" else "Ready for drop in; no local camera",
+        )
     }
 
     fun connectToPeer(peer: PeerDevice) {
         Log.d(logTag, "connectToPeer peer=${peer.displayName} host=${peer.host}:${peer.port}")
         dropInManager.endCall()
         signalingClient.disconnect()
+        dropInManager.prepareForCall(peer.effectiveDeviceClass())
         _uiState.value = _uiState.value.copy(
             selectedPeer = peer,
             hasRemoteVideo = false,
@@ -146,6 +171,7 @@ class DropInViewModel(
                     to = peer.serviceName,
                     sdp = offer.description,
                     sdpType = offer.type.canonicalForm(),
+                    deviceClass = dropInManager.localDeviceClass(),
                 ),
             )
         }
@@ -164,15 +190,17 @@ class DropInViewModel(
         }
     }
 
-    fun hangUp() {
+    fun hangUp(notifyPeer: Boolean = true) {
         Log.d(logTag, "hangUp tapped selectedPeer=${_uiState.value.selectedPeer?.displayName} isInCall=${_uiState.value.isInCall}")
-        val hangup = SignalEnvelope(
-            type = SignalType.HANGUP,
-            from = deviceName,
-            to = _uiState.value.selectedPeer?.serviceName,
-        )
-        signalingClient.send(hangup)
-        runtime.sendLocal(hangup)
+        if (notifyPeer) {
+            val hangup = SignalEnvelope(
+                type = SignalType.HANGUP,
+                from = deviceName,
+                to = _uiState.value.selectedPeer?.serviceName,
+            )
+            signalingClient.send(hangup)
+            runtime.sendLocal(hangup)
+        }
         signalingClient.disconnect()
         dropInManager.endCall()
         connectTimeoutJob?.cancel()
@@ -183,10 +211,9 @@ class DropInViewModel(
             isInCall = false,
             isSpeakerOn = true,
             hasRemoteVideo = false,
-            callDurationSeconds = 0,
-            connectionQuality = ConnectionQuality.UNKNOWN,
             status = "Ready for drop in",
         )
+        _callMetrics.value = CallMetrics()
     }
 
     fun setMicEnabled(enabled: Boolean) {
@@ -218,6 +245,15 @@ class DropInViewModel(
         )
     }
 
+    fun setTailnetRegistryUrl(url: String) {
+        runtime.updateTailnetRegistryUrl(url)
+        _uiState.value = _uiState.value.copy(
+            tailnetRegistryUrl = url.trim().trimEnd('/'),
+            status = if (url.isBlank()) "Tailnet registry cleared" else "Tailnet registry updated",
+        )
+        runtime.refreshPeers()
+    }
+
     fun swapVideoViews() {
         val remotePrimary = !_uiState.value.isRemotePrimary
         dropInManager.setRemotePrimary(remotePrimary)
@@ -226,7 +262,10 @@ class DropInViewModel(
 
     /** Pull-to-refresh: restarts NSD/tailnet discovery. */
     fun refreshPeers() {
-        _uiState.value = _uiState.value.copy(isRefreshing = true)
+        _uiState.value = _uiState.value.copy(
+            isRefreshing = true,
+            localTailscaleAddress = runtime.localTailscaleAddress(),
+        )
         runtime.refreshPeers()
         viewModelScope.launch {
             delay(1_500) // brief visual feedback
@@ -237,13 +276,13 @@ class DropInViewModel(
     // ── Call timer ────────────────────────────────────────────
     private fun startCallTimer() {
         callTimerJob?.cancel()
-        _uiState.value = _uiState.value.copy(callDurationSeconds = 0)
+        _callMetrics.value = CallMetrics()
         callTimerJob = viewModelScope.launch {
             var seconds = 0L
             while (true) {
                 delay(1_000)
                 seconds++
-                _uiState.value = _uiState.value.copy(callDurationSeconds = seconds)
+                _callMetrics.value = _callMetrics.value.copy(durationSeconds = seconds)
             }
         }
     }
@@ -267,7 +306,7 @@ class DropInViewModel(
                         rttMs < 300   -> ConnectionQuality.FAIR
                         else          -> ConnectionQuality.POOR
                     }
-                    _uiState.value = _uiState.value.copy(connectionQuality = quality)
+                    _callMetrics.value = _callMetrics.value.copy(connectionQuality = quality)
                 }
             }
         }
@@ -280,10 +319,12 @@ class DropInViewModel(
 
     // ── Recent peers persistence ─────────────────────────────
     private fun addRecentPeer(peer: PeerDevice) {
-        val current = _uiState.value.recentPeers.toMutableList()
-        current.removeAll { it.serviceName == peer.serviceName }
-        current.add(0, peer)
-        val trimmed = current.take(5)
+        val peerKey = peer.recentIdentityKey()
+        val current = _uiState.value.recentPeers
+            .filterNot { it.recentIdentityKey() == peerKey }
+            .toMutableList()
+        current.add(0, peer.normalizedRecentPeer())
+        val trimmed = current.dedupedRecentPeers().take(5)
         _uiState.value = _uiState.value.copy(recentPeers = trimmed)
         saveRecentPeers(trimmed)
     }
@@ -296,7 +337,7 @@ class DropInViewModel(
     private fun loadRecentPeers(): List<PeerDevice> {
         val raw = recentPrefs.getString("recents", "") ?: return emptyList()
         if (raw.isBlank()) return emptyList()
-        return raw.split("|").mapNotNull { entry ->
+        val peers = raw.split("|").mapNotNull { entry ->
             val parts = entry.split(";;")
             if (parts.size == 4) {
                 PeerDevice(
@@ -309,7 +350,40 @@ class DropInViewModel(
                 null
             }
         }
+        return peers.dedupedRecentPeers().take(5)
     }
+
+    private fun List<PeerDevice>.dedupedRecentPeers(): List<PeerDevice> =
+        distinctBy { it.recentIdentityKey() }
+
+    private fun PeerDevice.normalizedRecentPeer(): PeerDevice =
+        copy(
+            displayName = stableDisplayName(),
+            serviceName = stableServiceName(),
+        )
+
+    private fun PeerDevice.recentIdentityKey(): String {
+        val normalizedHost = host.trim().lowercase()
+        if (normalizedHost.isNotBlank()) return "host:$normalizedHost:$port"
+
+        val normalizedName = stableDisplayName().lowercase()
+        if (normalizedName.isNotBlank()) return "name:$normalizedName"
+
+        return "service:${stableServiceName().lowercase()}"
+    }
+
+    private fun PeerDevice.stableServiceName(): String {
+        val base = serviceName.trim().removePrefix("dropin-")
+        return "dropin-${base.stripTransientSuffix()}"
+    }
+
+    private fun PeerDevice.stableDisplayName(): String {
+        val base = displayName.trim().ifBlank { serviceName.trim().removePrefix("dropin-") }
+        return base.stripTransientSuffix()
+    }
+
+    private fun String.stripTransientSuffix(): String =
+        replace(Regex("-[0-9a-fA-F]{4}$"), "")
 
     // ── Called when a call is established ─────────────────────
     private fun onCallConnected(peer: PeerDevice) {
@@ -337,22 +411,36 @@ class DropInViewModel(
                     isSpeakerOn = true,
                     hasRemoteVideo = false,
                     selectedPeer = null,
-                    callDurationSeconds = 0,
-                    connectionQuality = ConnectionQuality.UNKNOWN,
                     status = "Call ended",
                 )
+                _callMetrics.value = CallMetrics()
             }
         }
     }
 
     private fun handleOffer(signal: SignalEnvelope) {
-        val peer = peers.value.firstOrNull { it.serviceName == signal.from } ?: PeerDevice(
-            serviceName = signal.from,
-            displayName = signal.from.removePrefix("dropin-"),
-            host = _uiState.value.selectedPeer?.host.orEmpty(),
-            port = _uiState.value.selectedPeer?.port ?: 8989,
-        ).also {
-            Log.w(logTag, "handleOffer using fallback peer serviceName=${signal.from}; knownPeers=${peers.value.map { known -> known.serviceName }}")
+        val peer = peers.value.firstOrNull { it.serviceName == signal.from } ?: run {
+            val tailnetHost = runtime.savedTailnetHost.value.trim()
+            val isTailnetTarget = signal.to == "dropin-tailnet-saved"
+            val fallbackHost = when {
+                isTailnetTarget && tailnetHost.isNotBlank() -> tailnetHost
+                !signal.remoteHost.isNullOrBlank() -> signal.remoteHost
+                else -> _uiState.value.selectedPeer?.host
+            }.orEmpty()
+
+            PeerDevice(
+                serviceName = signal.from,
+                displayName = signal.from.removePrefix("dropin-"),
+                host = fallbackHost,
+                port = _uiState.value.selectedPeer?.port ?: 8989,
+            ).also {
+                Log.w(
+                    logTag,
+                    "handleOffer using fallback peer serviceName=${signal.from}; " +
+                        "knownPeers=${peers.value.map { known -> known.serviceName }}; " +
+                        "tailnetTarget=$isTailnetTarget tailnetHost='$tailnetHost' remoteHost='${signal.remoteHost}' chosenHost='$fallbackHost'",
+                )
+            }
         }
         Log.d(logTag, "handleOffer peer=${peer.displayName}")
         _uiState.value = _uiState.value.copy(
@@ -363,6 +451,9 @@ class DropInViewModel(
 
         dropInManager.endCall()
         signalingClient.disconnect()
+        val peerClass = signal.deviceClass ?: peer.effectiveDeviceClass()
+        dropInManager.prepareForCall(peerClass)
+        ensureLocalMediaReady()
         if (peer.host.isNotBlank()) {
             signalingClient.connect(peer.host, peer.port)
         } else {
@@ -374,7 +465,6 @@ class DropInViewModel(
         }
         val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, signal.sdp.orEmpty())
         dropInManager.setRemoteDescription(remoteOffer) {
-            ensureLocalMediaReady()
             dropInManager.createAnswer { answer ->
                 Log.d(logTag, "sending answer to=${peer.serviceName}")
                 val response = SignalEnvelope(
@@ -383,6 +473,7 @@ class DropInViewModel(
                     to = peer.serviceName,
                     sdp = answer.description,
                     sdpType = answer.type.canonicalForm(),
+                    deviceClass = dropInManager.localDeviceClass(),
                 )
                 signalingClient.send(response)
                 runtime.sendLocal(response)
@@ -393,6 +484,7 @@ class DropInViewModel(
     private fun handleAnswer(signal: SignalEnvelope) {
         Log.d(logTag, "handleAnswer from=${signal.from}")
         connectTimeoutJob?.cancel()
+        signal.deviceClass?.let { dropInManager.prepareForCall(it) }
         val description = SessionDescription(SessionDescription.Type.ANSWER, signal.sdp.orEmpty())
         dropInManager.setRemoteDescription(description)
         val peer = _uiState.value.selectedPeer

@@ -5,7 +5,10 @@ import android.os.Build
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import com.bradhosk.dropin.DeviceCapability
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
 import org.webrtc.Camera2Enumerator
@@ -15,10 +18,14 @@ import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
+import org.webrtc.MediaStreamTrack
+import org.webrtc.RtpParameters
+import org.webrtc.RtpSender
 import org.webrtc.CameraVideoCapturer.CameraSwitchHandler
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RendererCommon
+import org.webrtc.RtpTransceiver
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.SurfaceViewRenderer
@@ -49,9 +56,14 @@ class DropInManager(
     private var previousSpeakerphoneState: Boolean = audioManager.isSpeakerphoneOn
     private var audioRouteInitialized = false
     private var speakerEnabled = true
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var connectionLostRunnable: Runnable? = null
+    private var connectionLostNotified = false
+    private var outboundProfile: VideoQualityProfile = defaultOutboundProfile()
 
     var onIceCandidateDiscovered: (IceCandidate) -> Unit = {}
     var onRemoteVideoReady: () -> Unit = {}
+    var onConnectionLost: () -> Unit = {}
 
     init {
         PeerConnectionFactory.initialize(
@@ -65,7 +77,19 @@ class DropInManager(
             .createPeerConnectionFactory()
     }
 
+    fun rebindVideoSinks() {
+        rebindLocalVideoSink()
+        rebindRemoteVideoSink()
+    }
+
     fun initializeRenderers(local: SurfaceViewRenderer, remote: SurfaceViewRenderer) {
+        val sameSurfaces = localRenderer === local && remoteRenderer === remote &&
+            initializedLocalRenderer === local && initializedRemoteRenderer === remote
+        if (sameSurfaces) {
+            rebindVideoSinks()
+            return
+        }
+
         if (localRenderer !== local) {
             localVideoTrack?.removeSink(localRenderer)
         }
@@ -82,31 +106,73 @@ class DropInManager(
         setRemotePrimary(true)
     }
 
-    fun startLocalMedia() {
-        Log.d(logTag, "startLocalMedia")
-        if (localVideoTrack != null) return
+    fun localDeviceClass(): String = DeviceCapability.localDeviceClass(appContext)
 
-        val surfaceTextureHelper = SurfaceTextureHelper.create("DropInCaptureThread", eglBase.eglBaseContext)
-        videoCapturer = createCameraCapturer() ?: return
-        videoSource = peerFactory.createVideoSource(false)
+    fun prepareForCall(peerDeviceClass: String) {
+        val peerClass = peerDeviceClass.ifBlank { DeviceCapability.CLASS_STANDARD }
+        val profile = VideoQualityProfile.forCall(localDeviceClass(), peerClass)
+        if (profile == outboundProfile) {
+            applyOutboundEncoding()
+            return
+        }
+        outboundProfile = profile
+        Log.d(
+            logTag,
+            "prepareForCall peerClass=$peerClass capture=${profile.captureWidth}x${profile.captureHeight}@${profile.captureFps} " +
+                "maxBitrate=${profile.maxBitrateBps}",
+        )
+        reconfigureCaptureIfNeeded()
+        applyOutboundEncoding()
+    }
+
+    fun startLocalMedia(): Boolean {
+        Log.d(logTag, "startLocalMedia")
+        if (localAudioTrack != null || localVideoTrack != null) return localVideoTrack != null
+
         audioSource = peerFactory.createAudioSource(MediaConstraints())
-        localVideoTrack = peerFactory.createVideoTrack("localVideo", videoSource)
         localAudioTrack = peerFactory.createAudioTrack("localAudio", audioSource)
 
-        videoCapturer?.initialize(surfaceTextureHelper, appContext, videoSource?.capturerObserver)
-        videoCapturer?.startCapture(1280, 720, 30)
+        val capturer = createCameraCapturer()
+        if (capturer == null) {
+            Log.w(logTag, "startLocalMedia no camera capturer; continuing with audio-only local media")
+            return false
+        }
+
+        val surfaceTextureHelper = SurfaceTextureHelper.create("DropInCaptureThread", eglBase.eglBaseContext)
+        videoCapturer = capturer
+        videoSource = peerFactory.createVideoSource(false)
+        localVideoTrack = peerFactory.createVideoTrack("localVideo", videoSource)
+
+        val profile = outboundProfile
+        runCatching {
+            capturer.initialize(surfaceTextureHelper, appContext, videoSource?.capturerObserver)
+            capturer.startCapture(profile.captureWidth, profile.captureHeight, profile.captureFps)
+        }.onFailure { error ->
+            Log.w(logTag, "startLocalMedia camera capture failed; continuing audio-only", error)
+            localVideoTrack?.dispose()
+            localVideoTrack = null
+            videoSource?.dispose()
+            videoSource = null
+            videoCapturer?.dispose()
+            videoCapturer = null
+            surfaceTextureHelper.dispose()
+        }
         rebindLocalVideoSink()
+        return localVideoTrack != null
     }
 
     fun createPeerConnection(onConnected: () -> Unit) {
         Log.d(logTag, "createPeerConnection existing=${peerConnection != null}")
         if (peerConnection != null) return
+        connectionLostNotified = false
         configureAudioRoute(useSpeaker = true)
         val rtcConfig = PeerConnection.RTCConfiguration(
             listOf(
                 PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
             ),
-        )
+        ).apply {
+            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+        }
         peerConnection = peerFactory.createPeerConnection(
             rtcConfig,
             object : PeerConnection.Observer {
@@ -123,13 +189,29 @@ class DropInManager(
 
                 override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
                     Log.d(logTag, "onConnectionChange state=$newState")
-                    if (newState == PeerConnection.PeerConnectionState.CONNECTED) {
-                        onConnected()
+                    when (newState) {
+                        PeerConnection.PeerConnectionState.CONNECTED -> {
+                            cancelConnectionLostCheck()
+                            applyOutboundEncoding()
+                            onConnected()
+                        }
+                        PeerConnection.PeerConnectionState.FAILED -> notifyConnectionLost()
+                        else -> Unit
                     }
                 }
 
                 override fun onSignalingChange(newState: PeerConnection.SignalingState?) = Unit
-                override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) = Unit
+                override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
+                    Log.d(logTag, "onIceConnectionChange state=$newState")
+                    when (newState) {
+                        PeerConnection.IceConnectionState.CONNECTED,
+                        PeerConnection.IceConnectionState.COMPLETED,
+                        -> cancelConnectionLostCheck()
+                        PeerConnection.IceConnectionState.DISCONNECTED -> scheduleConnectionLostCheck()
+                        PeerConnection.IceConnectionState.FAILED -> notifyConnectionLost()
+                        else -> Unit
+                    }
+                }
                 override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
                 override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) = Unit
                 override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate?>?) = Unit
@@ -149,13 +231,27 @@ class DropInManager(
         localAudioTrack?.setEnabled(true)
         localVideoTrack?.let { peerConnection?.addTrack(it, listOf("stream")) }
         localAudioTrack?.let { peerConnection?.addTrack(it, listOf("stream")) }
+        applyOutboundEncoding()
+        if (localVideoTrack == null) {
+            peerConnection?.addTransceiver(
+                MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
+                RtpTransceiver.RtpTransceiverInit(
+                    RtpTransceiver.RtpTransceiverDirection.RECV_ONLY,
+                    listOf("stream"),
+                ),
+            )
+        }
     }
 
     fun createOffer(onCreated: (SessionDescription) -> Unit) {
         peerConnection?.createOffer(object : SdpAdapter() {
             override fun onCreateSuccess(desc: SessionDescription?) {
                 if (desc == null) return
-                peerConnection?.setLocalDescription(SdpAdapter(), desc)
+                peerConnection?.setLocalDescription(object : SdpAdapter() {
+                    override fun onSetSuccess() {
+                        applyOutboundEncoding()
+                    }
+                }, desc)
                 onCreated(desc)
             }
         }, MediaConstraints())
@@ -165,7 +261,11 @@ class DropInManager(
         peerConnection?.createAnswer(object : SdpAdapter() {
             override fun onCreateSuccess(desc: SessionDescription?) {
                 if (desc == null) return
-                peerConnection?.setLocalDescription(SdpAdapter(), desc)
+                peerConnection?.setLocalDescription(object : SdpAdapter() {
+                    override fun onSetSuccess() {
+                        applyOutboundEncoding()
+                    }
+                }, desc)
                 onCreated(desc)
             }
         }, MediaConstraints())
@@ -174,6 +274,7 @@ class DropInManager(
     fun setRemoteDescription(description: SessionDescription, onSet: () -> Unit = {}) {
         peerConnection?.setRemoteDescription(object : SdpAdapter() {
             override fun onSetSuccess() {
+                applyOutboundEncoding()
                 onSet()
             }
         }, description)
@@ -221,8 +322,6 @@ class DropInManager(
     fun release() {
         endCall()
         stopLocalMedia()
-        localRenderer?.release()
-        remoteRenderer?.release()
         initializedLocalRenderer = null
         initializedRemoteRenderer = null
         localRenderer = null
@@ -232,11 +331,14 @@ class DropInManager(
 
     fun endCall() {
         Log.d(logTag, "endCall")
+        cancelConnectionLostCheck()
+        connectionLostNotified = false
         remoteVideoTrack?.removeSink(remoteRenderer)
         remoteVideoTrack = null
         peerConnection?.close()
         peerConnection?.dispose()
         peerConnection = null
+        outboundProfile = defaultOutboundProfile()
         restoreAudioRoute()
     }
 
@@ -359,6 +461,78 @@ class DropInManager(
         audioSource = null
     }
 
+    private fun scheduleConnectionLostCheck() {
+        cancelConnectionLostCheck()
+        connectionLostRunnable = Runnable {
+            val iceState = peerConnection?.iceConnectionState()
+            if (iceState == PeerConnection.IceConnectionState.DISCONNECTED ||
+                iceState == PeerConnection.IceConnectionState.FAILED
+            ) {
+                notifyConnectionLost()
+            }
+        }
+        mainHandler.postDelayed(connectionLostRunnable!!, CONNECTION_LOST_GRACE_MS)
+    }
+
+    private fun cancelConnectionLostCheck() {
+        connectionLostRunnable?.let { mainHandler.removeCallbacks(it) }
+        connectionLostRunnable = null
+    }
+
+    private fun notifyConnectionLost() {
+        if (connectionLostNotified || peerConnection == null) return
+        connectionLostNotified = true
+        cancelConnectionLostCheck()
+        onConnectionLost()
+    }
+
+    private fun reconfigureCaptureIfNeeded() {
+        val capturer = videoCapturer ?: return
+        val profile = outboundProfile
+        runCatching {
+            capturer.changeCaptureFormat(profile.captureWidth, profile.captureHeight, profile.captureFps)
+            Log.d(
+                logTag,
+                "reconfigureCapture ${profile.captureWidth}x${profile.captureHeight}@${profile.captureFps}",
+            )
+        }.onFailure { error ->
+            Log.w(logTag, "reconfigureCapture failed", error)
+        }
+    }
+
+    private fun applyOutboundEncoding() {
+        val sender = videoSender() ?: return
+        val profile = outboundProfile
+        val parameters = sender.parameters
+        val encodings = parameters.encodings?.toMutableList() ?: mutableListOf()
+        if (encodings.isEmpty()) {
+            encodings.add(RtpParameters.Encoding(VIDEO_ENCODING_ID, true, 1.0))
+        }
+        encodings[0] = encodings[0].apply {
+            active = true
+            maxBitrateBps = profile.maxBitrateBps
+            minBitrateBps = profile.minBitrateBps
+            maxFramerate = profile.captureFps
+            scaleResolutionDownBy = 1.0
+        }
+        parameters.encodings = encodings
+        parameters.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
+        if (!sender.setParameters(parameters)) {
+            Log.w(logTag, "applyOutboundEncoding setParameters failed")
+        } else {
+            Log.d(
+                logTag,
+                "applyOutboundEncoding maxBitrate=${profile.maxBitrateBps} fps=${profile.captureFps}",
+            )
+        }
+    }
+
+    private fun videoSender(): RtpSender? =
+        peerConnection?.senders?.firstOrNull { it.track()?.kind() == MediaStreamTrack.VIDEO_TRACK_KIND }
+
+    private fun defaultOutboundProfile(): VideoQualityProfile =
+        VideoQualityProfile.forCall(localDeviceClass(), DeviceCapability.CLASS_STANDARD)
+
     private fun createCameraCapturer(): CameraVideoCapturer? {
         val enumerator = Camera2Enumerator(appContext)
         val deviceNames = enumerator.deviceNames
@@ -372,6 +546,11 @@ class DropInManager(
         ).firstNotNullOfOrNull { name ->
             enumerator.createCapturer(name, null)
         }
+    }
+
+    companion object {
+        private const val CONNECTION_LOST_GRACE_MS = 8_000L
+        private const val VIDEO_ENCODING_ID = "dropin-video"
     }
 
     private open class SdpAdapter : org.webrtc.SdpObserver {

@@ -1,6 +1,7 @@
 package com.bradhosk.dropin.data
 
 import android.util.Log
+import com.bradhosk.dropin.model.PeerDevice
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoWSD
 import fi.iki.elonen.NanoHTTPD.IHTTPSession
@@ -12,6 +13,7 @@ import java.io.IOException
 
 class LocalSignalingServer(
     private val json: Json = Json { ignoreUnknownKeys = true },
+    private val registry: TailnetRegistryStore = TailnetRegistryStore(json),
 ) {
     private val logTag = "DropInApp"
     private val _events = MutableSharedFlow<SignalEnvelope>(extraBufferCapacity = 32)
@@ -25,7 +27,7 @@ class LocalSignalingServer(
     fun start(preferredPort: Int = 8989) {
         if (server != null) return
         Log.d(logTag, "local signaling server start port=$preferredPort")
-        server = SignalingWsd(preferredPort).also { it.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false) }
+        server = SignalingWsd(preferredPort).also { it.start(WEBSOCKET_READ_TIMEOUT_MS, false) }
     }
 
     fun stop() {
@@ -52,7 +54,45 @@ class LocalSignalingServer(
         }
 
         override fun serveHttp(session: IHTTPSession): Response {
-            return newFixedLengthResponse(Response.Status.OK, NanoHTTPD.MIME_PLAINTEXT, "DropIn signaling server")
+            val uri = session.uri.orEmpty()
+            return when {
+                uri == "/api/registry/register" && session.method == Method.POST ->
+                    handleRegistryRegister(session)
+                uri.startsWith("/api/registry/peers") && session.method == Method.GET ->
+                    handleRegistryPeers(session)
+                else ->
+                    newFixedLengthResponse(Response.Status.OK, NanoHTTPD.MIME_PLAINTEXT, "DropIn signaling server")
+            }
+        }
+
+        private fun handleRegistryRegister(session: IHTTPSession): Response {
+            val body = readBody(session)
+            val remoteHost = session.remoteIpAddress.orEmpty()
+            val ok = registry.registerFromJson(body, remoteHost)
+            return if (ok) {
+                newFixedLengthResponse(Response.Status.OK, MIME_JSON, """{"ok":true}""")
+            } else {
+                newFixedLengthResponse(
+                    Response.Status.BAD_REQUEST,
+                    MIME_JSON,
+                    """{"error":"service_name, host, and port are required"}""",
+                )
+            }
+        }
+
+        private fun handleRegistryPeers(session: IHTTPSession): Response {
+            val exclude = session.parms["exclude"]
+            return newFixedLengthResponse(
+                Response.Status.OK,
+                MIME_JSON,
+                registry.peersJson(exclude),
+            )
+        }
+
+        private fun readBody(session: IHTTPSession): String {
+            val map = hashMapOf<String, String>()
+            session.parseBody(map)
+            return map["postData"].orEmpty()
         }
     }
 
@@ -70,8 +110,9 @@ class LocalSignalingServer(
             runCatching {
                 json.decodeFromString(SignalEnvelope.serializer(), message.textPayload)
             }.onSuccess { decoded ->
-                Log.d(logTag, "local signaling receive type=${decoded.type} from=${decoded.from} to=${decoded.to}")
-                _events.tryEmit(decoded)
+                val signal = decoded.copy(remoteHost = handshakeRequest.remoteIpAddress)
+                Log.d(logTag, "local signaling receive type=${signal.type} from=${signal.from} to=${signal.to} remote=${signal.remoteHost}")
+                _events.tryEmit(signal)
             }
         }
 
@@ -79,5 +120,10 @@ class LocalSignalingServer(
         override fun onException(exception: IOException) {
             Log.e(logTag, "local signaling websocket exception", exception)
         }
+    }
+
+    private companion object {
+        const val WEBSOCKET_READ_TIMEOUT_MS = 0
+        const val MIME_JSON = "application/json"
     }
 }

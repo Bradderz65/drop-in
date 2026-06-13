@@ -1,6 +1,7 @@
 package com.bradhosk.dropin.data
 
 import android.util.Log
+import com.bradhosk.dropin.DeviceCapability
 import com.bradhosk.dropin.model.PeerDevice
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -14,8 +15,6 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -41,6 +40,8 @@ class TailnetRegistryDiscovery(
         localServiceName: String,
         displayName: String,
         portProvider: () -> Int,
+        hostProvider: () -> String,
+        deviceClassProvider: () -> String,
         registryUrl: StateFlow<String>,
     ) {
         syncJob?.cancel()
@@ -55,7 +56,14 @@ class TailnetRegistryDiscovery(
                 while (currentCoroutineContext().isActive) {
                     val port = portProvider()
                     if (port > 0) {
-                        registerPeer(baseUrl, localServiceName, displayName, port)
+                        registerPeer(
+                            baseUrl = baseUrl,
+                            localServiceName = localServiceName,
+                            displayName = displayName,
+                            port = port,
+                            host = hostProvider(),
+                            deviceClass = deviceClassProvider(),
+                        )
                         fetchPeers(baseUrl, localServiceName)?.let { discoveredPeers ->
                             _peers.value = discoveredPeers
                         }
@@ -77,6 +85,8 @@ class TailnetRegistryDiscovery(
         localServiceName: String,
         displayName: String,
         port: Int,
+        host: String,
+        deviceClass: String,
     ) {
         val payload = json.encodeToString(
             TailnetPeerRegistration.serializer(),
@@ -84,6 +94,8 @@ class TailnetRegistryDiscovery(
                 serviceName = localServiceName,
                 displayName = displayName,
                 port = port,
+                host = host,
+                deviceClass = deviceClass,
             ),
         )
         val request = Request.Builder()
@@ -98,7 +110,7 @@ class TailnetRegistryDiscovery(
                     }
                 }
             }.onFailure { error ->
-                Log.w(logTag, "tailnet registry register failed url=$baseUrl", error)
+                Log.w(logTag, "tailnet registry register failed url=$baseUrl host=$host", error)
             }
         }
     }
@@ -121,6 +133,7 @@ class TailnetRegistryDiscovery(
                             displayName = peer.displayName,
                             host = peer.host,
                             port = peer.port,
+                            deviceClass = peer.deviceClass ?: DeviceCapability.CLASS_STANDARD,
                         )
                     }
                 }
@@ -134,27 +147,3 @@ class TailnetRegistryDiscovery(
         private const val SYNC_INTERVAL_MS = 15_000L
     }
 }
-
-@Serializable
-data class TailnetPeerRegistration(
-    @SerialName("service_name")
-    val serviceName: String,
-    @SerialName("display_name")
-    val displayName: String,
-    val port: Int,
-)
-
-@Serializable
-data class TailnetPeerRecord(
-    @SerialName("service_name")
-    val serviceName: String,
-    @SerialName("display_name")
-    val displayName: String,
-    val host: String,
-    val port: Int,
-)
-
-@Serializable
-data class TailnetPeersResponse(
-    val peers: List<TailnetPeerRecord>,
-)

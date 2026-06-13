@@ -2,6 +2,7 @@ package com.bradhosk.dropin.data
 
 import android.content.Context
 import android.util.Log
+import com.bradhosk.dropin.DeviceCapability
 import com.bradhosk.dropin.model.PeerDevice
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -34,7 +35,14 @@ class DropInRuntime private constructor(
     private val _tailnetRegistryUrl = MutableStateFlow(
         preferences.getString(KEY_TAILNET_REGISTRY_URL, "").orEmpty(),
     )
+    private val effectiveRegistryUrl: StateFlow<String> = combine(_tailnetRegistryUrl, _savedTailnetHost) { registryUrl, savedHost ->
+        registryUrl.trim().trimEnd('/').ifBlank {
+            val host = savedHost.trim()
+            if (host.isBlank()) "" else "http://$host:$DEFAULT_REGISTRY_PORT"
+        }
+    }.stateIn(scope, SharingStarted.Eagerly, "")
     private val _nonOfferSignals = MutableSharedFlow<SignalEnvelope>(extraBufferCapacity = 32)
+    private val _incomingOffers = MutableSharedFlow<SignalEnvelope>(extraBufferCapacity = 32)
     private val _pendingOffer = MutableStateFlow<SignalEnvelope?>(null)
     private var started = false
 
@@ -44,21 +52,13 @@ class DropInRuntime private constructor(
     val tailnetRegistryUrl: StateFlow<String> = _tailnetRegistryUrl.asStateFlow()
     val peers: StateFlow<List<PeerDevice>> = combine(savedTailnetHost, peerDiscovery.peers, tailnetRegistry.peers) { savedHost, discovered, tailnet ->
         val manual = buildList {
-            add(
-                PeerDevice(
-                    serviceName = "dropin-PC-Test",
-                    displayName = "PC Test",
-                    host = "192.168.0.18",
-                    port = 8989,
-                ),
-            )
             if (savedHost.isNotBlank()) {
                 add(
                     PeerDevice(
                         serviceName = "dropin-tailnet-saved",
                         displayName = "Saved Tailscale Peer",
                         host = savedHost,
-                        port = 8989,
+                        port = signalingServer.port.takeIf { it > 0 } ?: DEFAULT_REGISTRY_PORT,
                     ),
                 )
             }
@@ -66,19 +66,9 @@ class DropInRuntime private constructor(
         (manual + discovered + tailnet)
             .distinctBy { it.serviceName }
             .sortedBy { it.displayName.lowercase() }
-    }.stateIn(
-        scope,
-        SharingStarted.Eagerly,
-        listOf(
-            PeerDevice(
-                serviceName = "dropin-PC-Test",
-                displayName = "PC Test",
-                host = "192.168.0.18",
-                port = 8989,
-            ),
-        ),
-    )
+    }.stateIn(scope, SharingStarted.Eagerly, emptyList())
     val signals = _nonOfferSignals.asSharedFlow()
+    val incomingOffers = _incomingOffers.asSharedFlow()
     val pendingOffer = _pendingOffer.asStateFlow()
 
     fun start() {
@@ -86,16 +76,12 @@ class DropInRuntime private constructor(
         started = true
         signalingServer.start()
         peerDiscovery.start(signalingServer.port)
-        tailnetRegistry.start(
-            localServiceName = localPeerId,
-            displayName = deviceName,
-            portProvider = { signalingServer.port },
-            registryUrl = tailnetRegistryUrl,
-        )
+        startTailnetRegistry()
         scope.launch {
             signalingServer.events.collect { signal ->
                 Log.d(logTag, "runtime signal type=${signal.type} from=${signal.from} to=${signal.to}")
                 if (signal.type == SignalType.OFFER) {
+                    _incomingOffers.emit(signal)
                     _pendingOffer.value = signal
                 } else {
                     _nonOfferSignals.emit(signal)
@@ -119,12 +105,7 @@ class DropInRuntime private constructor(
         peerDiscovery.stop()
         peerDiscovery.start(signalingServer.port)
         tailnetRegistry.stop()
-        tailnetRegistry.start(
-            localServiceName = localPeerId,
-            displayName = deviceName,
-            portProvider = { signalingServer.port },
-            registryUrl = tailnetRegistryUrl,
-        )
+        startTailnetRegistry()
     }
 
     fun sendLocal(message: SignalEnvelope) {
@@ -149,10 +130,27 @@ class DropInRuntime private constructor(
         preferences.edit().putString(KEY_SAVED_TAILNET_HOST, normalized).apply()
     }
 
+    fun localTailscaleAddress(): String? = TailscaleAddresses.primary()
+
+    private fun startTailnetRegistry() {
+        tailnetRegistry.start(
+            localServiceName = localPeerId,
+            displayName = deviceName,
+            portProvider = { signalingServer.port },
+            hostProvider = ::resolveAdvertisedHost,
+            deviceClassProvider = { DeviceCapability.localDeviceClass(appContext) },
+            registryUrl = effectiveRegistryUrl,
+        )
+    }
+
+    private fun resolveAdvertisedHost(): String =
+        TailscaleAddresses.primary().orEmpty()
+
     companion object {
         private const val PREFS_NAME = "dropin_runtime"
         private const val KEY_SAVED_TAILNET_HOST = "saved_tailnet_host"
         private const val KEY_TAILNET_REGISTRY_URL = "tailnet_registry_url"
+        private const val DEFAULT_REGISTRY_PORT = 8989
         @Volatile
         private var instance: DropInRuntime? = null
 

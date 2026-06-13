@@ -3,6 +3,8 @@ package com.bradhosk.dropin.data
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
+import com.bradhosk.dropin.DeviceCapability
 import com.bradhosk.dropin.model.PeerDevice
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -12,10 +14,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.net.InetAddress
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 
 class NsdPeerDiscovery(
-    context: Context,
+    private val context: Context,
     private val localServiceName: String,
 ) {
     private val nsdManager = context.getSystemService(NsdManager::class.java)
@@ -47,6 +50,9 @@ class NsdPeerDiscovery(
             serviceName = localServiceName
             serviceType = SERVICE_TYPE
             setPort(port)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                setAttribute(ATTR_DEVICE_CLASS, DeviceCapability.localDeviceClass(context))
+            }
         }
 
         val listener = object : NsdManager.RegistrationListener {
@@ -83,6 +89,7 @@ class NsdPeerDiscovery(
                                 displayName = resolvedServiceInfo.serviceName.removePrefix(NAME_PREFIX),
                                 host = hostAddress,
                                 port = resolvedServiceInfo.port,
+                                deviceClass = resolvedServiceInfo.readDeviceClass(),
                             )
                             discoveredPeers[peer.serviceName] = peer
                             emitPeers()
@@ -109,8 +116,23 @@ class NsdPeerDiscovery(
 
     private fun InetAddress.normalizeHost(): String = hostAddress.substringBefore('%')
 
+    private fun NsdServiceInfo.readDeviceClass(): String {
+        val rawClass = readDeviceClassAttribute().orEmpty()
+        return rawClass.ifBlank { DeviceCapability.CLASS_STANDARD }
+    }
+
+    private fun NsdServiceInfo.readDeviceClassAttribute(): String? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            return attributes[ATTR_DEVICE_CLASS]?.toString()
+        }
+        @Suppress("DEPRECATION")
+        val raw = attributes?.get(ATTR_DEVICE_CLASS) ?: return null
+        return String(raw, StandardCharsets.UTF_8)
+    }
+
     companion object {
         const val SERVICE_TYPE = "_dropin._tcp."
         const val NAME_PREFIX = "dropin-"
+        private const val ATTR_DEVICE_CLASS = "deviceClass"
     }
 }

@@ -4,6 +4,7 @@ import glob
 import json
 import logging
 import socket
+import subprocess
 import time
 from fractions import Fraction
 from typing import Optional
@@ -326,7 +327,7 @@ class DropInPeerServer:
         service_name = str(payload.get("service_name", "")).strip()
         display_name = str(payload.get("display_name", "")).strip() or service_name
         port = int(payload.get("port", 0))
-        host = request.remote or str(payload.get("host", "")).strip()
+        host = str(payload.get("host", "")).strip() or request.remote or ""
         if not service_name or not host or port <= 0:
             return web.json_response({"error": "service_name, host, and port are required"}, status=400)
         self.registry.register(
@@ -521,15 +522,76 @@ class DropInPeerServer:
             self.service_info = None
 
 
-def default_host() -> str:
+def lan_host() -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.connect(("8.8.8.8", 80))
         return sock.getsockname()[0]
 
 
+def is_tailscale_address(host: str) -> bool:
+    parts = host.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        first = int(parts[0])
+        second = int(parts[1])
+    except ValueError:
+        return False
+    return first == 100 and 64 <= second <= 127
+
+
+def tailscale_host() -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                host = line.strip()
+                if is_tailscale_address(host):
+                    return host
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    for host in _interface_ipv4_addresses():
+        if is_tailscale_address(host):
+            return host
+    return None
+
+
+def _interface_ipv4_addresses() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode == 0:
+            addresses: list[str] = []
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    addresses.append(parts[3].split("/")[0])
+            return addresses
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return []
+
+
+def advertised_host() -> str:
+    return tailscale_host() or lan_host()
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default=default_host())
+    parser.add_argument("--host", default=advertised_host(), help="Address advertised to remote peers")
+    parser.add_argument("--bind", default="0.0.0.0", help="Interface to bind the HTTP server")
     parser.add_argument("--port", type=int, default=8989)
     parser.add_argument("--name", default=f"dropin-PC-{socket.gethostname()}")
     parser.add_argument("--no-mdns", action="store_true")
@@ -561,9 +623,9 @@ async def main() -> None:
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, args.host, args.port)
+    site = web.TCPSite(runner, args.bind, args.port)
     await site.start()
-    LOG.info("listening on http://%s:%s", args.host, args.port)
+    LOG.info("listening on http://%s:%s (advertised as %s)", args.bind, args.port, args.host)
 
     try:
         while True:

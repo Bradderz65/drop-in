@@ -1,35 +1,33 @@
 package com.bradhosk.dropin
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.bradhosk.dropin.ui.CallVideoHost
 import com.bradhosk.dropin.ui.DropInScreen
 import com.bradhosk.dropin.ui.DropInTheme
 import com.bradhosk.dropin.ui.DropInViewModel
-import org.webrtc.SurfaceViewRenderer
 
 class MainActivity : ComponentActivity() {
     companion object {
@@ -42,39 +40,54 @@ class MainActivity : ComponentActivity() {
     }
 
     private val viewModel: DropInViewModel by viewModels()
+    private lateinit var videoHost: CallVideoHost
     private var permissionsGranted = false
-    private var localRenderer: SurfaceViewRenderer? = null
-    private var remoteRenderer: SurfaceViewRenderer? = null
+    private var localMediaStarted = false
     private var isFullscreen by mutableStateOf(false)
+    private val lockLandscape: Boolean by lazy { DeviceOrientation.shouldLockLandscape(this) }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { permissions ->
-        permissionsGranted = permissions.values.all { it }
+        permissionsGranted = permissions.values.all { it } || hasRequiredPermissions()
         maybeStartLocalMedia()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        showOverLockscreen()
         isFullscreen = savedInstanceState?.getBoolean(KEY_FULLSCREEN) ?: false
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.parseColor("#0E0E10")),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.parseColor("#0E0E10")),
         )
+        if (lockLandscape) {
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            applyImmersiveNavigation()
+        }
         DropInBackgroundService.start(this)
         requestRequiredPermissions()
+        applyOrientationLock()
         applyFullscreen(isFullscreen)
+
+        videoHost = CallVideoHost(this) { local, remote ->
+            viewModel.dropInManager.initializeRenderers(local, remote)
+            maybeStartLocalMedia()
+        }
 
         setContent {
             DropInTheme {
                 val state by viewModel.uiState.collectAsState()
                 LaunchedEffect(state.isInCall) {
                     if (!state.isInCall) {
-                        exitFullscreenToPortrait()
+                        exitFullscreenUi()
+                    } else {
+                        maybeStartLocalMedia()
                     }
                 }
                 DropInScreen(
                     state = state,
+                    callMetrics = viewModel.callMetrics,
                     isFullscreen = isFullscreen,
                     onConnect = viewModel::connectToPeer,
                     onToggleMic = viewModel::setMicEnabled,
@@ -83,13 +96,31 @@ class MainActivity : ComponentActivity() {
                     onSwitchCamera = viewModel::switchCamera,
                     onSwapViews = viewModel::swapVideoViews,
                     onSaveTailnetHost = viewModel::setSavedTailnetHost,
+                    onSaveTailnetRegistryUrl = viewModel::setTailnetRegistryUrl,
                     onToggleFullscreen = ::applyFullscreen,
                     onRefresh = viewModel::refreshPeers,
-                    onHangUp = viewModel::hangUp,
-                    localVideo = { modifier -> VideoRenderer("local", modifier) { renderer -> onLocalRendererCreated(renderer) } },
-                    remoteVideo = { modifier -> VideoRenderer("remote", modifier) { renderer -> onRemoteRendererCreated(renderer) } },
+                    onHangUp = { viewModel.hangUp() },
+                    onOpenHomeAssistant = ::openHomeAssistant,
+                    localVideo = { modifier -> videoHost.Local(modifier) },
+                    remoteVideo = { modifier -> videoHost.Remote(modifier) },
                 )
             }
+        }
+    }
+
+    override fun onDestroy() {
+        if (::videoHost.isInitialized) {
+            videoHost.release()
+        }
+        super.onDestroy()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        showOverLockscreen()
+        applyOrientationLock()
+        if (lockLandscape && !isFullscreen) {
+            applyImmersiveNavigation()
         }
     }
 
@@ -106,7 +137,24 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestRequiredPermissions() {
-        val permissions = buildList {
+        val permissions = requiredPermissions()
+        permissionsGranted = permissions.all { permission ->
+            ContextCompat.checkSelfPermission(this, permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (permissionsGranted) {
+            maybeStartLocalMedia()
+            return
+        }
+        permissionLauncher.launch(permissions.toTypedArray())
+    }
+
+    private fun hasRequiredPermissions(): Boolean =
+        requiredPermissions().all { permission ->
+            ContextCompat.checkSelfPermission(this, permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+
+    private fun requiredPermissions(): List<String> =
+        buildList {
             add(Manifest.permission.CAMERA)
             add(Manifest.permission.RECORD_AUDIO)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -114,47 +162,18 @@ class MainActivity : ComponentActivity() {
                 add(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
-        permissionLauncher.launch(permissions.toTypedArray())
-    }
 
     private fun maybeStartLocalMedia() {
-        val local = localRenderer
-        val remote = remoteRenderer
-        if (!permissionsGranted || local == null || remote == null) return
-        viewModel.dropInManager.initializeRenderers(local, remote)
-        viewModel.startLocalMedia()
-    }
-
-    @Composable
-    private fun VideoRenderer(
-        tag: String,
-        modifier: Modifier,
-        onRendererCreated: (SurfaceViewRenderer) -> Unit,
-    ) {
-        val context = LocalContext.current
-        val renderer = remember(tag) {
-            SurfaceViewRenderer(context).also(onRendererCreated)
+        if (!permissionsGranted) return
+        if (!localMediaStarted) {
+            localMediaStarted = true
+            viewModel.startLocalMedia()
         }
-        AndroidView(
-            modifier = modifier,
-            factory = { renderer },
-            update = { onRendererCreated(it) },
-        )
-    }
-
-    private fun onLocalRendererCreated(renderer: SurfaceViewRenderer) {
-        localRenderer = renderer
-        maybeStartLocalMedia()
-    }
-
-    private fun onRemoteRendererCreated(renderer: SurfaceViewRenderer) {
-        remoteRenderer = renderer
-        maybeStartLocalMedia()
     }
 
     private fun applyFullscreen(enabled: Boolean) {
         if (!enabled) {
-            exitFullscreenToPortrait()
+            exitFullscreenUi()
             return
         }
         isFullscreen = enabled
@@ -167,13 +186,60 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun exitFullscreenToPortrait() {
+    private fun exitFullscreenUi() {
         isFullscreen = false
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        WindowCompat.setDecorFitsSystemWindows(window, true)
+        applyOrientationLock()
+        if (lockLandscape) {
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            applyImmersiveNavigation()
+        } else {
+            WindowCompat.setDecorFitsSystemWindows(window, true)
+            WindowInsetsControllerCompat(window, window.decorView).apply {
+                systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+
+    private fun applyImmersiveNavigation() {
         WindowInsetsControllerCompat(window, window.decorView).apply {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            show(WindowInsetsCompat.Type.systemBars())
+            hide(WindowInsetsCompat.Type.navigationBars())
+            show(WindowInsetsCompat.Type.statusBars())
         }
+    }
+
+    private fun applyOrientationLock() {
+        requestedOrientation = if (lockLandscape) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+    }
+
+    private fun showOverLockscreen() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+            val keyguardManager = getSystemService(KeyguardManager::class.java)
+            keyguardManager?.requestDismissKeyguard(this, null)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                    WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD,
+            )
+        }
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun openHomeAssistant() {
+        if (HomeAssistantLauncher.openAndBackground(this)) return
+        Toast.makeText(
+            this,
+            "Home Assistant app is not installed",
+            Toast.LENGTH_SHORT,
+        ).show()
     }
 }

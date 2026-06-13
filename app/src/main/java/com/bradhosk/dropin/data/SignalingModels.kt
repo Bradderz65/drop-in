@@ -11,6 +11,8 @@ data class SignalEnvelope(
     val sdp: String? = null,
     val sdpType: String? = null,
     val candidate: IceCandidatePayload? = null,
+    val remoteHost: String? = null,
+    val deviceClass: String? = null,
 )
 
 @Serializable
