@@ -16,12 +16,16 @@ import com.bradhosk.dropin.model.PeerDevice
 import com.bradhosk.dropin.webrtc.DropInManager
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
 import org.webrtc.IceCandidate
 import org.webrtc.SessionDescription
 
@@ -60,6 +64,7 @@ class DropInViewModel(
     private var qualityPollingJob: Job? = null
 
     private val recentPrefs = application.getSharedPreferences("dropin_recents", Context.MODE_PRIVATE)
+    private val recentsStore = RecentPeersStore(recentPrefs)
 
     private val _uiState = MutableStateFlow(
         DropInUiState(
@@ -279,7 +284,7 @@ class DropInViewModel(
         _callMetrics.value = CallMetrics()
         callTimerJob = viewModelScope.launch {
             var seconds = 0L
-            while (true) {
+            while (isActive) {
                 delay(1_000)
                 seconds++
                 _callMetrics.value = _callMetrics.value.copy(durationSeconds = seconds)
@@ -296,7 +301,7 @@ class DropInViewModel(
     private fun startQualityPolling() {
         qualityPollingJob?.cancel()
         qualityPollingJob = viewModelScope.launch {
-            while (true) {
+            while (isActive) {
                 delay(3_000)
                 dropInManager.getRoundTripTimeMs { rttMs ->
                     val quality = when {
@@ -326,32 +331,10 @@ class DropInViewModel(
         current.add(0, peer.normalizedRecentPeer())
         val trimmed = current.dedupedRecentPeers().take(5)
         _uiState.value = _uiState.value.copy(recentPeers = trimmed)
-        saveRecentPeers(trimmed)
+        recentsStore.save(trimmed)
     }
 
-    private fun saveRecentPeers(list: List<PeerDevice>) {
-        val serialized = list.joinToString("|") { "${it.serviceName};;${it.displayName};;${it.host};;${it.port}" }
-        recentPrefs.edit().putString("recents", serialized).apply()
-    }
-
-    private fun loadRecentPeers(): List<PeerDevice> {
-        val raw = recentPrefs.getString("recents", "") ?: return emptyList()
-        if (raw.isBlank()) return emptyList()
-        val peers = raw.split("|").mapNotNull { entry ->
-            val parts = entry.split(";;")
-            if (parts.size == 4) {
-                PeerDevice(
-                    serviceName = parts[0],
-                    displayName = parts[1],
-                    host = parts[2],
-                    port = parts[3].toIntOrNull() ?: 8989,
-                )
-            } else {
-                null
-            }
-        }
-        return peers.dedupedRecentPeers().take(5)
-    }
+    private fun loadRecentPeers(): List<PeerDevice> = recentsStore.load()
 
     private fun List<PeerDevice>.dedupedRecentPeers(): List<PeerDevice> =
         distinctBy { it.recentIdentityKey() }
@@ -562,5 +545,87 @@ class DropInViewModel(
 
     private fun ensureLocalMediaReady() {
         dropInManager.startLocalMedia()
+    }
+}
+
+class RecentPeersStore(
+    private val preferences: android.content.SharedPreferences,
+    private val json: Json = Json { ignoreUnknownKeys = true },
+) {
+    fun save(peers: List<PeerDevice>) {
+        val encoded = json.encodeToString(
+            ListSerializer(RecentPeer.serializer()),
+            peers.take(MAX_RECENTS).map(RecentPeer::fromPeerDevice),
+        )
+        preferences.edit().putString(KEY_RECENTS, encoded).apply()
+    }
+
+    fun load(): List<PeerDevice> {
+        val raw = preferences.getString(KEY_RECENTS, "").orEmpty()
+        if (raw.isBlank()) return emptyList()
+        return runCatching {
+            json.decodeFromString(ListSerializer(RecentPeer.serializer()), raw)
+                .map { it.toPeerDevice() }
+        }.getOrElse {
+            loadLegacyDelimited(raw)
+        }.deduped().take(MAX_RECENTS)
+    }
+
+    private fun loadLegacyDelimited(raw: String): List<PeerDevice> =
+        raw.split("|").mapNotNull { entry ->
+            val parts = entry.split(";;")
+            if (parts.size == 4) {
+                PeerDevice(
+                    serviceName = parts[0],
+                    displayName = parts[1],
+                    host = parts[2],
+                    port = parts[3].toIntOrNull() ?: DEFAULT_SIGNALING_PORT,
+                )
+            } else {
+                null
+            }
+        }
+
+    private fun List<PeerDevice>.deduped(): List<PeerDevice> =
+        distinctBy { peer ->
+            val normalizedHost = peer.host.trim().lowercase()
+            if (normalizedHost.isNotBlank()) {
+                "host:$normalizedHost:${peer.port}"
+            } else {
+                "service:${peer.serviceName.trim().lowercase()}"
+            }
+        }
+
+    @Serializable
+    private data class RecentPeer(
+        val serviceName: String,
+        val displayName: String,
+        val host: String,
+        val port: Int,
+        val deviceClass: String = "standard",
+    ) {
+        fun toPeerDevice(): PeerDevice = PeerDevice(
+            serviceName = serviceName,
+            displayName = displayName,
+            host = host,
+            port = port,
+            deviceClass = deviceClass,
+        )
+
+        companion object {
+            fun fromPeerDevice(peer: PeerDevice): RecentPeer = RecentPeer(
+                serviceName = peer.serviceName,
+                displayName = peer.displayName,
+                host = peer.host,
+                port = peer.port,
+                deviceClass = peer.deviceClass,
+            )
+        }
+    }
+
+    private companion object {
+        const val KEY_RECENTS = "recents"
+        const val MAX_RECENTS = 5
+        const val DEFAULT_SIGNALING_PORT = 8989
     }
 }
