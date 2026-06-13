@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.serialization.json.Json
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 
 class LocalSignalingServer(
     private val json: Json = Json { ignoreUnknownKeys = true },
@@ -17,7 +18,8 @@ class LocalSignalingServer(
 ) {
     private val logTag = "DropInApp"
     private val _events = MutableSharedFlow<SignalEnvelope>(extraBufferCapacity = 32)
-    private var webSocket: SignalingSocket? = null
+    private val sockets = ConcurrentHashMap.newKeySet<SignalingSocket>()
+    private val socketsByPeer = ConcurrentHashMap<String, SignalingSocket>()
     private var server: SignalingWsd? = null
 
     val events = _events.asSharedFlow()
@@ -31,16 +33,27 @@ class LocalSignalingServer(
     }
 
     fun stop() {
-        runCatching { webSocket?.close(WebSocketFrame.CloseCode.NormalClosure, "bye", false) }
-        webSocket = null
+        sockets.forEach { socket ->
+            runCatching { socket.close(WebSocketFrame.CloseCode.NormalClosure, "bye", false) }
+        }
+        sockets.clear()
+        socketsByPeer.clear()
         server?.stop()
         server = null
     }
 
     fun send(message: SignalEnvelope) {
         Log.d(logTag, "local signaling send type=${message.type} to=${message.to}")
-        runCatching {
-            webSocket?.send(json.encodeToString(SignalEnvelope.serializer(), message))
+        val encoded = json.encodeToString(SignalEnvelope.serializer(), message)
+        val targetSocket = message.to?.let(socketsByPeer::get)
+        val recipients = targetSocket?.let(::listOf) ?: sockets.toList()
+        if (recipients.isEmpty()) {
+            Log.w(logTag, "local signaling no websocket recipients for type=${message.type} to=${message.to}")
+            return
+        }
+        recipients.forEach { socket ->
+            runCatching { socket.send(encoded) }
+                .onFailure { Log.w(logTag, "local signaling send failed", it) }
         }
     }
 
@@ -49,7 +62,7 @@ class LocalSignalingServer(
         override fun openWebSocket(handshake: IHTTPSession): WebSocket {
             Log.d(logTag, "local signaling socket opened from=${handshake.remoteIpAddress}")
             return SignalingSocket(handshake).also { socket ->
-                webSocket = socket
+                sockets += socket
             }
         }
 
@@ -103,7 +116,8 @@ class LocalSignalingServer(
 
         override fun onClose(code: WebSocketFrame.CloseCode?, reason: String?, initiatedByRemote: Boolean) {
             Log.d(logTag, "local signaling websocket onClose code=$code reason=$reason initiatedByRemote=$initiatedByRemote")
-            webSocket = null
+            sockets -= this
+            socketsByPeer.entries.removeIf { it.value === this }
         }
 
         override fun onMessage(message: WebSocketFrame) {
@@ -111,8 +125,11 @@ class LocalSignalingServer(
                 json.decodeFromString(SignalEnvelope.serializer(), message.textPayload)
             }.onSuccess { decoded ->
                 val signal = decoded.copy(remoteHost = handshakeRequest.remoteIpAddress)
+                socketsByPeer[signal.from] = this
                 Log.d(logTag, "local signaling receive type=${signal.type} from=${signal.from} to=${signal.to} remote=${signal.remoteHost}")
                 _events.tryEmit(signal)
+            }.onFailure { error ->
+                Log.w(logTag, "local signaling failed to decode websocket message", error)
             }
         }
 
