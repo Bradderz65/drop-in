@@ -123,7 +123,13 @@ class DropInViewModel(
             }
         }
 
-        _uiState.value = _uiState.value.copy(localTailscaleAddress = runtime.localTailscaleAddress())
+        _uiState.value = _uiState.value.copy(localTailscaleAddress = runtime.localTailscaleAddress.value)
+
+        viewModelScope.launch {
+            runtime.localTailscaleAddress.collect { address ->
+                _uiState.value = _uiState.value.copy(localTailscaleAddress = address)
+            }
+        }
 
         viewModelScope.launch {
             runtime.signals.collect(::handleSignal)
@@ -182,7 +188,7 @@ class DropInViewModel(
         }
         connectTimeoutJob?.cancel()
         connectTimeoutJob = viewModelScope.launch {
-            delay(8_000)
+            delay(CONNECTION_TIMEOUT_MS)
             if (!_uiState.value.isInCall && _uiState.value.selectedPeer?.serviceName == peer.serviceName) {
                 Log.w(logTag, "connect timeout peer=${peer.displayName}")
                 signalingClient.disconnect()
@@ -269,7 +275,7 @@ class DropInViewModel(
     fun refreshPeers() {
         _uiState.value = _uiState.value.copy(
             isRefreshing = true,
-            localTailscaleAddress = runtime.localTailscaleAddress(),
+            localTailscaleAddress = runtime.localTailscaleAddress.value,
         )
         runtime.refreshPeers()
         viewModelScope.launch {
@@ -545,6 +551,11 @@ class DropInViewModel(
 
     private fun ensureLocalMediaReady() {
         dropInManager.startLocalMedia()
+    }
+
+    private companion object {
+        // Tailnet routes may need time to establish a DERP path and complete ICE negotiation.
+        const val CONNECTION_TIMEOUT_MS = 25_000L
     }
 }
 

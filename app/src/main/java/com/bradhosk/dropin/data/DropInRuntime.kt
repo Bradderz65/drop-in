@@ -29,6 +29,7 @@ class DropInRuntime private constructor(
     private val signalingServer = LocalSignalingServer()
     private val peerDiscovery = NsdPeerDiscovery(appContext, localServiceName)
     private val tailnetRegistry = TailnetRegistryDiscovery(scope)
+    private val tailnetPeerDiscovery = TailnetPeerDiscovery(appContext, scope)
     private val _savedTailnetHost = MutableStateFlow(
         preferences.getString(KEY_SAVED_TAILNET_HOST, "").orEmpty(),
     )
@@ -50,7 +51,13 @@ class DropInRuntime private constructor(
     val localPeerId: String = localServiceName
     val savedTailnetHost: StateFlow<String> = _savedTailnetHost.asStateFlow()
     val tailnetRegistryUrl: StateFlow<String> = _tailnetRegistryUrl.asStateFlow()
-    val peers: StateFlow<List<PeerDevice>> = combine(savedTailnetHost, peerDiscovery.peers, tailnetRegistry.peers) { savedHost, discovered, tailnet ->
+    val localTailscaleAddress: StateFlow<String?> = tailnetPeerDiscovery.localAddress
+    val peers: StateFlow<List<PeerDevice>> = combine(
+        savedTailnetHost,
+        peerDiscovery.peers,
+        tailnetPeerDiscovery.peers,
+        tailnetRegistry.peers,
+    ) { savedHost, discovered, directTailnet, tailnetRegistryPeers ->
         val manual = buildList {
             if (savedHost.isNotBlank()) {
                 add(
@@ -63,7 +70,7 @@ class DropInRuntime private constructor(
                 )
             }
         }
-        (manual + discovered + tailnet)
+        (discovered + directTailnet + tailnetRegistryPeers + manual)
             .distinctBy { it.serviceName }
             .sortedBy { it.displayName.lowercase() }
     }.stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -71,11 +78,23 @@ class DropInRuntime private constructor(
     val incomingOffers = _incomingOffers.asSharedFlow()
     val pendingOffer = _pendingOffer.asStateFlow()
 
+    init {
+        signalingServer.setIdentityProvider {
+            TailnetPeerIdentity(
+                serviceName = localPeerId,
+                displayName = deviceName,
+                port = signalingServer.port,
+                deviceClass = DeviceCapability.localDeviceClass(appContext),
+            )
+        }
+    }
+
     fun start() {
         if (started) return
         started = true
         signalingServer.start()
         peerDiscovery.start(signalingServer.port)
+        tailnetPeerDiscovery.start()
         startTailnetRegistry()
         scope.launch {
             signalingServer.events.collect { signal ->
@@ -95,6 +114,7 @@ class DropInRuntime private constructor(
         started = false
         signalingServer.stop()
         peerDiscovery.stop()
+        tailnetPeerDiscovery.stop()
         tailnetRegistry.stop()
         _pendingOffer.value = null
     }
@@ -104,6 +124,7 @@ class DropInRuntime private constructor(
         if (!started) return
         peerDiscovery.stop()
         peerDiscovery.start(signalingServer.port)
+        tailnetPeerDiscovery.refreshSoon()
         tailnetRegistry.stop()
         startTailnetRegistry()
     }
@@ -129,8 +150,6 @@ class DropInRuntime private constructor(
         _savedTailnetHost.value = normalized
         preferences.edit().putString(KEY_SAVED_TAILNET_HOST, normalized).apply()
     }
-
-    fun localTailscaleAddress(): String? = TailscaleAddresses.primary()
 
     private fun startTailnetRegistry() {
         tailnetRegistry.start(

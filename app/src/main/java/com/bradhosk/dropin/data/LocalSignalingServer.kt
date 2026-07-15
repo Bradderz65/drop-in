@@ -20,6 +20,8 @@ class LocalSignalingServer(
     private val _events = MutableSharedFlow<SignalEnvelope>(extraBufferCapacity = 32)
     private val sockets = ConcurrentHashMap.newKeySet<SignalingSocket>()
     private val socketsByPeer = ConcurrentHashMap<String, SignalingSocket>()
+    @Volatile
+    private var identityProvider: (() -> TailnetPeerIdentity)? = null
     private var server: SignalingWsd? = null
 
     val events = _events.asSharedFlow()
@@ -40,6 +42,10 @@ class LocalSignalingServer(
         socketsByPeer.clear()
         server?.stop()
         server = null
+    }
+
+    fun setIdentityProvider(provider: () -> TailnetPeerIdentity) {
+        identityProvider = provider
     }
 
     fun send(message: SignalEnvelope) {
@@ -69,6 +75,7 @@ class LocalSignalingServer(
         override fun serveHttp(session: IHTTPSession): Response {
             val uri = session.uri.orEmpty()
             return when {
+                uri == "/api/identity" && session.method == Method.GET -> handleIdentity()
                 uri == "/api/registry/register" && session.method == Method.POST ->
                     handleRegistryRegister(session)
                 uri.startsWith("/api/registry/peers") && session.method == Method.GET ->
@@ -76,6 +83,16 @@ class LocalSignalingServer(
                 else ->
                     newFixedLengthResponse(Response.Status.OK, NanoHTTPD.MIME_PLAINTEXT, "DropIn signaling server")
             }
+        }
+
+        private fun handleIdentity(): Response {
+            val identity = identityProvider?.invoke()
+                ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_JSON, "{}")
+            return newFixedLengthResponse(
+                Response.Status.OK,
+                MIME_JSON,
+                json.encodeToString(TailnetPeerIdentity.serializer(), identity),
+            )
         }
 
         private fun handleRegistryRegister(session: IHTTPSession): Response {

@@ -106,3 +106,14 @@ data class TailnetPeerRecord(
 data class TailnetPeersResponse(
     val peers: List<TailnetPeerRecord>,
 )
+
+@Serializable
+data class TailnetPeerIdentity(
+    @SerialName("service_name")
+    val serviceName: String,
+    @SerialName("display_name")
+    val displayName: String,
+    val port: Int,
+    @SerialName("device_class")
+    val deviceClass: String? = null,
+)

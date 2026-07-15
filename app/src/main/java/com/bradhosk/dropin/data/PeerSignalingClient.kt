@@ -27,14 +27,18 @@ class PeerSignalingClient(
     private var socket: WebSocket? = null
     private val pendingMessages = ArrayDeque<String>()
     private var isConnected = false
+    private var isConnecting = false
+    private var connectionId = 0L
 
     val events = _events.asSharedFlow()
     val status = _status.asSharedFlow()
 
     fun connect(host: String, port: Int) {
-        synchronized(lock) {
-            if (socket != null) return
+        val newConnectionId = synchronized(lock) {
+            if (socket != null || isConnecting) return
             isConnected = false
+            isConnecting = true
+            ++connectionId
         }
         val request = Request.Builder()
             .url("ws://$host:$port")
@@ -42,13 +46,17 @@ class PeerSignalingClient(
         Log.d(logTag, "signaling connect ws://$host:$port")
         _status.tryEmit(PeerSignalingStatus.Connecting(host, port))
 
-        socket = httpClient.newWebSocket(
+        val newSocket = httpClient.newWebSocket(
             request,
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     Log.d(logTag, "signaling open")
                     val messagesToSend = synchronized(lock) {
-                        if (socket !== webSocket) return@synchronized emptyList<String>()
+                        if (connectionId != newConnectionId || !isConnecting) {
+                            return@synchronized emptyList<String>()
+                        }
+                        socket = webSocket
+                        isConnecting = false
                         isConnected = true
                         buildList {
                             while (pendingMessages.isNotEmpty()) {
@@ -73,8 +81,9 @@ class PeerSignalingClient(
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     Log.d(logTag, "signaling closed code=$code reason=$reason")
                     synchronized(lock) {
-                        if (socket === webSocket) {
+                        if (connectionId == newConnectionId && socket === webSocket) {
                             isConnected = false
+                            isConnecting = false
                             socket = null
                         }
                     }
@@ -84,8 +93,9 @@ class PeerSignalingClient(
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     Log.e(logTag, "signaling failure", t)
                     synchronized(lock) {
-                        if (socket === webSocket) {
+                        if (connectionId == newConnectionId) {
                             isConnected = false
+                            isConnecting = false
                             socket = null
                         }
                     }
@@ -93,6 +103,14 @@ class PeerSignalingClient(
                 }
             },
         )
+        synchronized(lock) {
+            when {
+                connectionId != newConnectionId -> newSocket.close(1000, "superseded")
+                isConnecting -> socket = newSocket
+                socket !== newSocket -> newSocket.close(1000, "superseded")
+                else -> Unit
+            }
+        }
     }
 
     fun send(message: SignalEnvelope) {
@@ -117,6 +135,8 @@ class PeerSignalingClient(
         val socketToClose = synchronized(lock) {
             pendingMessages.clear()
             isConnected = false
+            isConnecting = false
+            connectionId++
             socket.also { socket = null }
         }
         socketToClose?.close(1000, "bye")
