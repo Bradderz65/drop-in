@@ -40,10 +40,26 @@ class PeerSignalingClient(
             isConnecting = true
             ++connectionId
         }
-        val request = Request.Builder()
-            .url("ws://$host:$port")
-            .build()
-        Log.d(logTag, "signaling connect ws://$host:$port")
+        val request = runCatching {
+            require(host.isNotBlank()) { "Peer host is blank" }
+            require(port in 1..65535) { "Peer port is invalid: $port" }
+            Request.Builder()
+                .url("ws://$host:$port")
+                .build()
+        }.getOrElse { error ->
+            synchronized(lock) {
+                if (connectionId == newConnectionId) {
+                    isConnected = false
+                    isConnecting = false
+                    socket = null
+                }
+            }
+            val message = error.message ?: "Invalid peer address"
+            Log.w(logTag, "signaling rejected peer address host=$host port=$port", error)
+            _status.tryEmit(PeerSignalingStatus.Failed(message))
+            return
+        }
+        Log.d(logTag, "signaling connect ${request.url}")
         _status.tryEmit(PeerSignalingStatus.Connecting(host, port))
 
         val newSocket = httpClient.newWebSocket(

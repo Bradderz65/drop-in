@@ -62,6 +62,7 @@ class DropInViewModel(
     private var connectTimeoutJob: Job? = null
     private var callTimerJob: Job? = null
     private var qualityPollingJob: Job? = null
+    private var connectedPeerServiceName: String? = null
 
     private val recentPrefs = application.getSharedPreferences("dropin_recents", Context.MODE_PRIVATE)
     private val recentsStore = RecentPeersStore(recentPrefs)
@@ -162,6 +163,14 @@ class DropInViewModel(
 
     fun connectToPeer(peer: PeerDevice) {
         Log.d(logTag, "connectToPeer peer=${peer.displayName} host=${peer.host}:${peer.port}")
+        if (peer.host.isBlank() || peer.port !in 1..65535) {
+            _uiState.value = _uiState.value.copy(
+                selectedPeer = null,
+                status = "Invalid address for ${peer.displayName}",
+            )
+            return
+        }
+        connectedPeerServiceName = null
         dropInManager.endCall()
         signalingClient.disconnect()
         dropInManager.prepareForCall(peer.effectiveDeviceClass())
@@ -214,6 +223,7 @@ class DropInViewModel(
         }
         signalingClient.disconnect()
         dropInManager.endCall()
+        connectedPeerServiceName = null
         connectTimeoutJob?.cancel()
         stopCallTimer()
         stopQualityPolling()
@@ -376,15 +386,27 @@ class DropInViewModel(
 
     // ── Called when a call is established ─────────────────────
     private fun onCallConnected(peer: PeerDevice) {
+        if (connectedPeerServiceName == peer.serviceName && _uiState.value.isInCall) return
+        connectedPeerServiceName = peer.serviceName
+        connectTimeoutJob?.cancel()
         _uiState.value = _uiState.value.copy(isInCall = true, status = "Connected to ${peer.displayName}")
         addRecentPeer(peer)
         startCallTimer()
         startQualityPolling()
     }
 
-    // ── Signal handling (unchanged logic) ────────────────────
+    // ── Signal handling ──────────────────────────────────────
     private fun handleSignal(signal: SignalEnvelope) {
         Log.d(logTag, "handleSignal type=${signal.type} from=${signal.from} to=${signal.to}")
+        if (signal.to != null && signal.to != deviceName && signal.to != "dropin-tailnet-saved") {
+            Log.d(logTag, "ignoring signal addressed to=${signal.to}")
+            return
+        }
+        val activePeer = _uiState.value.selectedPeer?.serviceName
+        if (signal.type != SignalType.OFFER && activePeer != null && signal.from != activePeer) {
+            Log.d(logTag, "ignoring signal from unrelated peer=${signal.from} activePeer=$activePeer")
+            return
+        }
         when (signal.type) {
             SignalType.OFFER -> handleOffer(signal)
             SignalType.ANSWER -> handleAnswer(signal)
@@ -392,6 +414,7 @@ class DropInViewModel(
             SignalType.HANGUP -> {
                 signalingClient.disconnect()
                 dropInManager.endCall()
+                connectedPeerServiceName = null
                 connectTimeoutJob?.cancel()
                 stopCallTimer()
                 stopQualityPolling()
@@ -432,6 +455,7 @@ class DropInViewModel(
             }
         }
         Log.d(logTag, "handleOffer peer=${peer.displayName}")
+        connectedPeerServiceName = null
         _uiState.value = _uiState.value.copy(
             selectedPeer = peer,
             hasRemoteVideo = false,
