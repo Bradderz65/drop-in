@@ -1,5 +1,6 @@
 package com.bradhosk.dropin.data
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -21,8 +22,8 @@ class TailnetRegistryStoreTest {
         assertTrue(store.registerFromJson(registration(port = 8_989), "100.64.1.2"))
 
         val peer = store.peers().single()
-        assertTrue(peer.host == "100.64.1.2")
-        assertTrue(peer.port == 8_989)
+        assertEquals("100.64.1.2", peer.host)
+        assertEquals(8_989, peer.port)
     }
 
     private fun registration(port: Int): String =

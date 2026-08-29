@@ -98,12 +98,12 @@ class TailnetRegistryDiscovery(
                 deviceClass = deviceClass,
             ),
         )
-        val request = Request.Builder()
-            .url("$baseUrl/api/registry/register")
-            .post(payload.toRequestBody(JSON_MEDIA_TYPE))
-            .build()
         withContext(Dispatchers.IO) {
             runCatching {
+                val request = Request.Builder()
+                    .url("$baseUrl/api/registry/register")
+                    .post(payload.toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
                 httpClient.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) {
                         throw IllegalStateException("registry register failed ${response.code}")

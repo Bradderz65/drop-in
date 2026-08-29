@@ -9,4 +9,6 @@ __pycache__/
 *.pyc
 .idea/
 .jdk17/
+.local-jdks/
+.venv*/
 echo_show_screenshot.png
