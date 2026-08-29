@@ -155,6 +155,10 @@ class PeerSignalingClient(
             if (isConnected) {
                 socket
             } else {
+                if (pendingMessages.size >= MAX_PENDING_MESSAGES) {
+                    pendingMessages.removeFirst()
+                    Log.w(logTag, "signaling queue full; dropped oldest message")
+                }
                 pendingMessages.addLast(encoded)
                 null
             }
@@ -176,6 +180,10 @@ class PeerSignalingClient(
             socket.also { socket = null }
         }
         socketToClose?.close(1000, "bye")
+    }
+
+    private companion object {
+        const val MAX_PENDING_MESSAGES = 64
     }
 }
 

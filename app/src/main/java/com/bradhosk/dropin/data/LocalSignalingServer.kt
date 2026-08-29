@@ -30,8 +30,22 @@ class LocalSignalingServer(
 
     fun start(preferredPort: Int = 8989) {
         if (server != null) return
-        Log.d(logTag, "local signaling server start port=$preferredPort")
-        server = SignalingWsd(preferredPort).also { it.start(WEBSOCKET_READ_TIMEOUT_MS, false) }
+        val ports = listOf(preferredPort, 0).distinct()
+        for (port in ports) {
+            val candidate = SignalingWsd(port)
+            val started = runCatching {
+                candidate.start(WEBSOCKET_READ_TIMEOUT_MS, false)
+            }.onFailure { error ->
+                Log.w(logTag, "local signaling server failed to start on port=$port", error)
+                candidate.stop()
+            }.isSuccess
+            if (started) {
+                server = candidate
+                Log.d(logTag, "local signaling server started port=${candidate.listeningPort}")
+                return
+            }
+        }
+        Log.e(logTag, "local signaling server could not bind to any port")
     }
 
     fun stop() {
@@ -111,7 +125,7 @@ class LocalSignalingServer(
         }
 
         private fun handleRegistryPeers(session: IHTTPSession): Response {
-            val exclude = session.parms["exclude"]
+            val exclude = session.parameters["exclude"]?.firstOrNull()
             return newFixedLengthResponse(
                 Response.Status.OK,
                 MIME_JSON,

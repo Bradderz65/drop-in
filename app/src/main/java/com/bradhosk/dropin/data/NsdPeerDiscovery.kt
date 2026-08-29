@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
+import android.util.Log
 import com.bradhosk.dropin.DeviceCapability
 import com.bradhosk.dropin.model.PeerDevice
 import kotlinx.coroutines.CoroutineScope
@@ -32,8 +33,11 @@ class NsdPeerDiscovery(
     val peers: StateFlow<List<PeerDevice>> = _peers.asStateFlow()
 
     fun start(port: Int) {
-        registerService(port)
-        discoverServices()
+        if (port !in 1..65535) return
+        runCatching { registerService(port) }
+            .onFailure { error -> Log.w(LOG_TAG, "NSD registration could not start", error) }
+        runCatching { discoverServices() }
+            .onFailure { error -> Log.w(LOG_TAG, "NSD discovery could not start", error) }
     }
 
     fun stop() {
@@ -114,7 +118,7 @@ class NsdPeerDiscovery(
         }
     }
 
-    private fun InetAddress.normalizeHost(): String = hostAddress.substringBefore('%')
+    private fun InetAddress.normalizeHost(): String = hostAddress?.substringBefore('%').orEmpty()
 
     private fun NsdServiceInfo.readDeviceClass(): String {
         val rawClass = readDeviceClassAttribute().orEmpty()
@@ -130,5 +134,6 @@ class NsdPeerDiscovery(
         const val SERVICE_TYPE = "_dropin._tcp."
         const val NAME_PREFIX = "dropin-"
         private const val ATTR_DEVICE_CLASS = "deviceClass"
+        private const val LOG_TAG = "DropInApp"
     }
 }

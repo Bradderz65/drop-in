@@ -5,6 +5,12 @@
         android:name="android.hardware.camera.any"
         android:required="false" />
     <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.wifi"
+        android:required="false" />
+    <uses-feature
         android:name="android.hardware.microphone"
         android:required="false" />
     <uses-feature
@@ -61,8 +67,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:showWhenLocked="true"
-            android:turnScreenOn="true"
-            android:screenOrientation="fullSensor">
+            android:turnScreenOn="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 
