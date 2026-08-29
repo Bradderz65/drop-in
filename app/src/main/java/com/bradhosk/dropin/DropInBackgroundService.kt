@@ -341,10 +341,14 @@ class DropInBackgroundService : Service() {
         private const val WAKE_LOCK_TIMEOUT_MS = 10_000L
 
         fun start(context: Context) {
-            androidx.core.content.ContextCompat.startForegroundService(
-                context,
-                Intent(context, DropInBackgroundService::class.java),
-            )
+            runCatching {
+                androidx.core.content.ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, DropInBackgroundService::class.java),
+                )
+            }.onFailure { error ->
+                Log.e("DropInApp", "could not start background service", error)
+            }
         }
     }
 }

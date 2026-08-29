@@ -67,55 +67,75 @@ class PeerSignalingClient(
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     Log.d(logTag, "signaling open")
-                    val messagesToSend = synchronized(lock) {
+                    val messagesToSend: List<String>? = synchronized(lock) {
                         if (connectionId != newConnectionId || !isConnecting) {
-                            return@synchronized emptyList<String>()
+                            return@synchronized null
                         }
                         socket = webSocket
                         isConnecting = false
                         isConnected = true
-                        buildList {
+                        buildList<String> {
                             while (pendingMessages.isNotEmpty()) {
                                 add(pendingMessages.removeFirst())
                             }
                         }
+                    }
+                    if (messagesToSend == null) {
+                        webSocket.close(1000, "superseded")
+                        return
                     }
                     _status.tryEmit(PeerSignalingStatus.Connected)
                     messagesToSend.forEach(webSocket::send)
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
+                    val isCurrentConnection = synchronized(lock) {
+                        connectionId == newConnectionId && isConnected && socket === webSocket
+                    }
+                    if (!isCurrentConnection) return
                     Log.d(logTag, "signaling message length=${text.length}")
                     runCatching {
                         json.decodeFromString(SignalEnvelope.serializer(), text)
                     }.onSuccess { message ->
                         Log.d(logTag, "signaling receive type=${message.type} from=${message.from} to=${message.to}")
                         _events.tryEmit(message)
+                    }.onFailure { error ->
+                        Log.w(logTag, "signaling ignored malformed message", error)
                     }
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     Log.d(logTag, "signaling closed code=$code reason=$reason")
-                    synchronized(lock) {
-                        if (connectionId == newConnectionId && socket === webSocket) {
+                    val wasCurrentConnection = synchronized(lock) {
+                        if (connectionId != newConnectionId || socket !== webSocket) {
+                            false
+                        } else {
                             isConnected = false
                             isConnecting = false
                             socket = null
+                            true
                         }
                     }
-                    _status.tryEmit(PeerSignalingStatus.Closed(code, reason))
+                    if (wasCurrentConnection) {
+                        _status.tryEmit(PeerSignalingStatus.Closed(code, reason))
+                    }
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     Log.e(logTag, "signaling failure", t)
-                    synchronized(lock) {
-                        if (connectionId == newConnectionId) {
+                    val wasCurrentConnection = synchronized(lock) {
+                        if (connectionId != newConnectionId || socket !== webSocket) {
+                            false
+                        } else {
                             isConnected = false
                             isConnecting = false
                             socket = null
+                            true
                         }
                     }
-                    _status.tryEmit(PeerSignalingStatus.Failed(t.message ?: "Unknown signaling error"))
+                    if (wasCurrentConnection) {
+                        _status.tryEmit(PeerSignalingStatus.Failed(t.message ?: "Unknown signaling error"))
+                    }
                 }
             },
         )

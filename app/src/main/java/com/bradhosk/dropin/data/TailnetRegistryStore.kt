@@ -19,7 +19,7 @@ class TailnetRegistryStore(
         deviceClass: String = DeviceCapability.CLASS_STANDARD,
         persistent: Boolean = false,
     ) {
-        if (serviceName.isBlank() || host.isBlank() || port <= 0) return
+        if (serviceName.isBlank() || host.isBlank() || port !in VALID_PORT_RANGE) return
         synchronized(lock) {
             records[serviceName] = TailnetPeerRecord(
                 serviceName = serviceName,
@@ -58,7 +58,7 @@ class TailnetRegistryStore(
             json.decodeFromString(TailnetPeerRegistration.serializer(), body)
         }.getOrNull() ?: return false
         val host = payload.host?.trim().orEmpty().ifBlank { remoteHost.trim() }
-        if (payload.serviceName.isBlank() || host.isBlank() || payload.port <= 0) return false
+        if (payload.serviceName.isBlank() || host.isBlank() || payload.port !in VALID_PORT_RANGE) return false
         register(
             serviceName = payload.serviceName,
             displayName = payload.displayName,
@@ -71,6 +71,7 @@ class TailnetRegistryStore(
 
     private companion object {
         const val REGISTRY_TTL_SECONDS = 45L
+        val VALID_PORT_RANGE = 1..65535
     }
 }
 
