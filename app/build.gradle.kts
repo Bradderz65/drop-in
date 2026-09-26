@@ -20,8 +20,8 @@ android {
         // the current Play-required target until those flows are device-tested.
         //noinspection OldTargetApi
         targetSdk = 36
-        versionCode = 21
-        versionName = "1.0.20"
+        versionCode = 22
+        versionName = "1.0.21"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
