@@ -5,26 +5,34 @@ import java.net.NetworkInterface
 
 object TailscaleAddresses {
     fun all(): List<String> =
-        NetworkInterface.getNetworkInterfaces()
-            .toList()
-            .flatMap { networkInterface ->
-                networkInterface.inetAddresses
-                    .toList()
-                    .filterIsInstance<Inet4Address>()
-                    .mapNotNull { address ->
-                        val host = address.hostAddress?.substringBefore('%')?.trim().orEmpty()
-                        host.takeIf { isTailscaleAddress(it) }
+        runCatching {
+            NetworkInterface.getNetworkInterfaces()
+                ?.toList()
+                .orEmpty()
+                .flatMap { networkInterface ->
+                    networkInterface.inetAddresses
+                        ?.toList()
+                        .orEmpty()
+                        .filterIsInstance<Inet4Address>()
+                        .mapNotNull { address ->
+                            val host = address.hostAddress?.substringBefore('%')?.trim().orEmpty()
+                            host.takeIf(::isTailscaleAddress)
+                        }
                     }
-            }
-            .distinct()
+                .distinct()
+        }.getOrDefault(emptyList())
 
     fun primary(): String? = all().firstOrNull()
 
     fun isTailscaleAddress(host: String): Boolean {
-        val parts = host.split('.')
-        if (parts.size != 4) return false
-        val first = parts[0].toIntOrNull() ?: return false
-        val second = parts[1].toIntOrNull() ?: return false
-        return first == 100 && second in 64..127
+        val octets = host.split('.').map { it.toIntOrNull() ?: return false }
+        return octets.size == IPV4_OCTET_COUNT &&
+            octets.all { it in IPV4_OCTET_RANGE } &&
+            octets[0] == 100 &&
+            octets[1] in TAILSCALE_SECOND_OCTET_RANGE
     }
+
+    private const val IPV4_OCTET_COUNT = 4
+    private val IPV4_OCTET_RANGE = 0..255
+    private val TAILSCALE_SECOND_OCTET_RANGE = 64..127
 }

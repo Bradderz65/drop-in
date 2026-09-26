@@ -21,6 +21,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.toColorInt
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -41,16 +42,15 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: DropInViewModel by viewModels()
     private lateinit var videoHost: CallVideoHost
-    private var permissionsGranted = false
-    private var localMediaStarted = false
     private var isFullscreen by mutableStateOf(false)
-    private val lockLandscape: Boolean by lazy { DeviceOrientation.shouldLockLandscape(this) }
+    private val lockLandscape: Boolean by lazy { DeviceCapability.shouldLockLandscape(this) }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
-    ) { permissions ->
-        permissionsGranted = permissions.values.all { it } || hasRequiredPermissions()
-        if (permissionsGranted) {
+    ) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            hasPermission(Manifest.permission.NEARBY_WIFI_DEVICES)
+        ) {
             viewModel.refreshPeers()
         }
         maybeStartLocalMedia()
@@ -61,8 +61,8 @@ class MainActivity : ComponentActivity() {
         showOverLockscreen()
         isFullscreen = savedInstanceState?.getBoolean(KEY_FULLSCREEN) ?: false
         enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.parseColor("#0E0E10")),
-            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.parseColor("#0E0E10")),
+            statusBarStyle = SystemBarStyle.dark("#0E0E10".toColorInt()),
+            navigationBarStyle = SystemBarStyle.dark("#0E0E10".toColorInt()),
         )
         if (lockLandscape) {
             WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -123,6 +123,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         showOverLockscreen()
         applyOrientationLock()
+        maybeStartLocalMedia()
         if (lockLandscape && !isFullscreen) {
             applyImmersiveNavigation()
         }
@@ -142,20 +143,17 @@ class MainActivity : ComponentActivity() {
 
     private fun requestRequiredPermissions() {
         val permissions = requiredPermissions()
-        permissionsGranted = permissions.all { permission ->
-            ContextCompat.checkSelfPermission(this, permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        }
-        if (permissionsGranted) {
+        val missingPermissions = permissions.filterNot(::hasPermission)
+        if (missingPermissions.isEmpty()) {
             maybeStartLocalMedia()
             return
         }
-        permissionLauncher.launch(permissions.toTypedArray())
+        permissionLauncher.launch(missingPermissions.toTypedArray())
     }
 
-    private fun hasRequiredPermissions(): Boolean =
-        requiredPermissions().all { permission ->
-            ContextCompat.checkSelfPermission(this, permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        }
+    private fun hasPermission(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(this, permission) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
 
     private fun requiredPermissions(): List<String> =
         buildList {
@@ -168,11 +166,7 @@ class MainActivity : ComponentActivity() {
         }
 
     private fun maybeStartLocalMedia() {
-        if (!permissionsGranted) return
-        if (!localMediaStarted) {
-            localMediaStarted = true
-            viewModel.startLocalMedia()
-        }
+        viewModel.startLocalMedia()
     }
 
     private fun applyFullscreen(enabled: Boolean) {

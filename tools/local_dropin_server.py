@@ -1,13 +1,15 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
 import glob
+import ipaddress
 import json
 import logging
 import socket
 import subprocess
 import time
 from fractions import Fraction
-from typing import Optional
 
 from aiohttp import WSMsgType, web
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
@@ -21,6 +23,9 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 LOG = logging.getLogger("dropin-server")
 SERVICE_TYPE = "_dropin._tcp.local."
 REGISTRY_TTL_SECONDS = 45
+VALID_PORT_RANGE = range(1, 65_536)
+DEFAULT_PORT = 8989
+TAILSCALE_IPV4_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 UI_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -187,13 +192,13 @@ UI_HTML = """<!doctype html>
 class TestPatternVideoTrack(VideoStreamTrack):
     def __init__(self) -> None:
         super().__init__()
-        self._start = time.time()
+        self._start = time.monotonic()
 
     async def recv(self) -> VideoFrame:
         pts, time_base = await self.next_timestamp()
         width, height = 640, 360
         frame = VideoFrame(width=width, height=height, format="rgb24")
-        elapsed = time.time() - self._start
+        elapsed = time.monotonic() - self._start
         r = int((elapsed * 40) % 255)
         g = int((elapsed * 20 + 80) % 255)
         b = int((elapsed * 10 + 160) % 255)
@@ -208,18 +213,30 @@ class TailnetRegistry:
     def __init__(self) -> None:
         self._records: dict[str, dict] = {}
 
-    def register(self, service_name: str, display_name: str, host: str, port: int, persistent: bool = False) -> None:
+    def register(
+        self,
+        service_name: str,
+        display_name: str,
+        host: str,
+        port: int,
+        device_class: str = "standard",
+        persistent: bool = False,
+    ) -> bool:
+        if not service_name.strip() or not host.strip() or port not in VALID_PORT_RANGE:
+            return False
         self._records[service_name] = {
             "service_name": service_name,
-            "display_name": display_name,
+            "display_name": display_name or service_name,
             "host": host,
             "port": port,
+            "device_class": device_class or "standard",
             "persistent": persistent,
-            "last_seen": time.time(),
+            "last_seen": time.monotonic(),
         }
+        return True
 
-    def peers(self, exclude: Optional[str] = None) -> list[dict]:
-        now = time.time()
+    def peers(self, exclude: str | None = None) -> list[dict]:
+        now = time.monotonic()
         stale_keys = [
             key for key, record in self._records.items()
             if not record["persistent"] and now - record["last_seen"] > REGISTRY_TTL_SECONDS
@@ -232,6 +249,7 @@ class TailnetRegistry:
                 "display_name": record["display_name"],
                 "host": record["host"],
                 "port": record["port"],
+                "device_class": record["device_class"],
             }
             for key, record in sorted(self._records.items())
             if key != exclude
@@ -245,13 +263,13 @@ class DropInPeerServer:
         self.service_name = service_name
         self.advertise = advertise
         self.registry = registry
-        self.zeroconf: Optional[Zeroconf] = None
-        self.service_info: Optional[ServiceInfo] = None
-        self.peer_connection: Optional[RTCPeerConnection] = None
-        self.web_socket: Optional[web.WebSocketResponse] = None
-        self.remote_id: Optional[str] = None
-        self.video_player: Optional[MediaPlayer] = None
-        self.audio_player: Optional[MediaPlayer] = None
+        self.zeroconf: Zeroconf | None = None
+        self.service_info: ServiceInfo | None = None
+        self.peer_connection: RTCPeerConnection | None = None
+        self.web_socket: web.WebSocketResponse | None = None
+        self.remote_id: str | None = None
+        self.video_player: MediaPlayer | None = None
+        self.audio_player: MediaPlayer | None = None
         self.enable_camera = True
         self.enable_microphone = False
         self.available_camera_devices = self._list_camera_devices()
@@ -265,6 +283,8 @@ class DropInPeerServer:
 
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        if self.web_socket is not None and not self.web_socket.closed:
+            await self.web_socket.close(code=1001, message=b"replaced by a newer connection")
         LOG.info("websocket opened from %s", request.remote)
         self.web_socket = ws
         self.connection_state = "signaling-connected"
@@ -274,16 +294,30 @@ class DropInPeerServer:
             async for msg in ws:
                 if msg.type != WSMsgType.TEXT:
                     continue
-                payload = json.loads(msg.data)
+                try:
+                    payload = json.loads(msg.data)
+                except (TypeError, json.JSONDecodeError):
+                    LOG.warning("ignoring malformed websocket JSON from %s", request.remote)
+                    continue
+                if not isinstance(payload, dict):
+                    LOG.warning("ignoring non-object websocket payload from %s", request.remote)
+                    continue
                 LOG.info("recv type=%s from=%s to=%s", payload.get("type"), payload.get("from"), payload.get("to"))
-                await self._handle_signal(payload)
+                try:
+                    await self._handle_signal(payload)
+                except Exception:
+                    LOG.exception("could not process %s signal", payload.get("type"))
+                    self.connection_state = "failed"
+                    self.status_text = "The latest signaling message could not be processed."
+                    await self._close_peer_connection()
         finally:
             LOG.info("websocket closed")
-            self.web_socket = None
-            if self.connection_state != "idle":
-                self.connection_state = "idle"
-                self.status_text = "Waiting for a phone to connect."
-            await self._close_peer_connection()
+            if self.web_socket is ws:
+                self.web_socket = None
+                if self.connection_state != "idle":
+                    self.connection_state = "idle"
+                    self.status_text = "Waiting for a phone to connect."
+                await self._close_peer_connection()
 
         return ws
 
@@ -303,9 +337,13 @@ class DropInPeerServer:
         )
 
     async def handle_config(self, request: web.Request) -> web.StreamResponse:
-        payload = await request.json()
-        self.enable_camera = bool(payload.get("enable_camera", self.enable_camera))
-        self.enable_microphone = bool(payload.get("enable_microphone", self.enable_microphone))
+        payload = await self._read_json_object(request)
+        if payload is None:
+            return web.json_response({"error": "a JSON object is required"}, status=400)
+        if isinstance(payload.get("enable_camera"), bool):
+            self.enable_camera = payload["enable_camera"]
+        if isinstance(payload.get("enable_microphone"), bool):
+            self.enable_microphone = payload["enable_microphone"]
         selected_camera_device = payload.get("selected_camera_device", self.selected_camera_device)
         if selected_camera_device in self.available_camera_devices:
             self.selected_camera_device = selected_camera_device
@@ -323,19 +361,26 @@ class DropInPeerServer:
         return await self.handle_state(request)
 
     async def handle_registry_register(self, request: web.Request) -> web.StreamResponse:
-        payload = await request.json()
+        payload = await self._read_json_object(request)
+        if payload is None:
+            return web.json_response({"error": "a JSON object is required"}, status=400)
         service_name = str(payload.get("service_name", "")).strip()
         display_name = str(payload.get("display_name", "")).strip() or service_name
-        port = int(payload.get("port", 0))
+        try:
+            port = int(payload.get("port", 0))
+        except (TypeError, ValueError):
+            port = 0
         host = str(payload.get("host", "")).strip() or request.remote or ""
-        if not service_name or not host or port <= 0:
-            return web.json_response({"error": "service_name, host, and port are required"}, status=400)
-        self.registry.register(
+        device_class = str(payload.get("device_class", "standard")).strip() or "standard"
+        registered = self.registry.register(
             service_name=service_name,
             display_name=display_name,
             host=host,
             port=port,
+            device_class=device_class,
         )
+        if not registered:
+            return web.json_response({"error": "service_name, host, and a valid port are required"}, status=400)
         LOG.info("registry register service=%s host=%s port=%s", service_name, host, port)
         return web.json_response({"ok": True})
 
@@ -343,11 +388,26 @@ class DropInPeerServer:
         exclude = request.query.get("exclude")
         return web.json_response({"peers": self.registry.peers(exclude=exclude)})
 
+    @staticmethod
+    async def _read_json_object(request: web.Request) -> dict | None:
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
     async def _handle_signal(self, payload: dict) -> None:
         signal_type = payload.get("type")
-        self.remote_id = payload.get("from")
+        remote_id = str(payload.get("from", "")).strip()
+        if not remote_id:
+            LOG.warning("ignoring %s signal with no sender", signal_type)
+            return
+        self.remote_id = remote_id
 
         if signal_type == "offer":
+            if not isinstance(payload.get("sdp"), str) or not payload["sdp"].strip():
+                LOG.warning("ignoring offer with no SDP")
+                return
             await self._handle_offer(payload)
         elif signal_type == "ice":
             await self._handle_ice(payload)
@@ -424,13 +484,17 @@ class DropInPeerServer:
         if not raw_candidate:
             LOG.warning("ignoring ICE payload with no candidate body")
             return
-        ice = candidate_from_sdp(raw_candidate)
+        try:
+            ice = candidate_from_sdp(raw_candidate)
+        except (TypeError, ValueError):
+            LOG.warning("ignoring malformed ICE candidate")
+            return
         ice.sdpMid = candidate.get("sdpMid")
         ice.sdpMLineIndex = candidate.get("sdpMLineIndex")
         await self.peer_connection.addIceCandidate(ice)
 
     async def _send(self, payload: dict) -> None:
-        if self.web_socket is None:
+        if self.web_socket is None or self.web_socket.closed:
             LOG.warning("dropping outbound signal; no websocket")
             return
         LOG.info("send type=%s to=%s", payload.get("type"), payload.get("to"))
@@ -441,17 +505,17 @@ class DropInPeerServer:
             await self.peer_connection.close()
             self.peer_connection = None
         if self.video_player is not None:
-            if self.video_player.video is not None:
-                self.video_player._stop(self.video_player.video)
-            if self.video_player.audio is not None:
-                self.video_player._stop(self.video_player.audio)
+            self._stop_player(self.video_player)
             self.video_player = None
         if self.audio_player is not None:
-            if self.audio_player.video is not None:
-                self.audio_player._stop(self.audio_player.video)
-            if self.audio_player.audio is not None:
-                self.audio_player._stop(self.audio_player.audio)
+            self._stop_player(self.audio_player)
             self.audio_player = None
+
+    @staticmethod
+    def _stop_player(player: MediaPlayer) -> None:
+        for track in (player.video, player.audio):
+            if track is not None:
+                track.stop()
 
     def _create_outbound_video_track(self) -> VideoStreamTrack:
         try:
@@ -498,49 +562,61 @@ class DropInPeerServer:
         if not self.advertise:
             LOG.info("mdns disabled; not advertising service")
             return
-        properties = {"device": "pc-test-peer"}
+        properties = {"device": "pc-test-peer", "deviceClass": "standard"}
         LOG.info("registering zeroconf service %s", self.service_name)
-        self.zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
-        self.service_info = ServiceInfo(
-            type_=SERVICE_TYPE,
-            name=f"{self.service_name}.{SERVICE_TYPE}",
-            addresses=[socket.inet_aton(self.host)],
-            port=self.port,
-            properties=properties,
-            server=f"{socket.gethostname()}.local.",
-        )
-        self.zeroconf.register_service(self.service_info)
-        LOG.info("advertising %s on %s:%s", self.service_name, self.host, self.port)
+        try:
+            address = ipaddress.ip_address(self.host)
+            if address.version != 4:
+                raise ValueError("mDNS test-server advertising currently requires an IPv4 address")
+            self.zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
+            self.service_info = ServiceInfo(
+                type_=SERVICE_TYPE,
+                name=f"{self.service_name}.{SERVICE_TYPE}",
+                addresses=[address.packed],
+                port=self.port,
+                properties=properties,
+                server=f"{socket.gethostname()}.local.",
+            )
+            self.zeroconf.register_service(self.service_info)
+            LOG.info("advertising %s on %s:%s", self.service_name, self.host, self.port)
+        except Exception:
+            LOG.exception("could not advertise mDNS service on %s", self.host)
+            if self.zeroconf is not None:
+                self.zeroconf.close()
+            self.zeroconf = None
+            self.service_info = None
 
     def unregister_service(self) -> None:
         if not self.advertise:
             return
         if self.zeroconf and self.service_info:
-            self.zeroconf.unregister_service(self.service_info)
+            try:
+                self.zeroconf.unregister_service(self.service_info)
+            except Exception:
+                LOG.exception("could not unregister mDNS service")
             self.zeroconf.close()
             self.zeroconf = None
             self.service_info = None
 
 
 def lan_host() -> str:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
 
 
 def is_tailscale_address(host: str) -> bool:
-    parts = host.split(".")
-    if len(parts) != 4:
-        return False
     try:
-        first = int(parts[0])
-        second = int(parts[1])
+        address = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return first == 100 and 64 <= second <= 127
+    return isinstance(address, ipaddress.IPv4Address) and address in TAILSCALE_IPV4_NETWORK
 
 
-def tailscale_host() -> Optional[str]:
+def tailscale_host() -> str | None:
     try:
         result = subprocess.run(
             ["tailscale", "ip", "-4"],
@@ -592,10 +668,12 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default=advertised_host(), help="Address advertised to remote peers")
     parser.add_argument("--bind", default="0.0.0.0", help="Interface to bind the HTTP server")
-    parser.add_argument("--port", type=int, default=8989)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--name", default=f"dropin-PC-{socket.gethostname()}")
     parser.add_argument("--no-mdns", action="store_true")
     args = parser.parse_args()
+    if args.port not in VALID_PORT_RANGE:
+        parser.error("--port must be between 1 and 65535")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     server = DropInPeerServer(
@@ -610,6 +688,7 @@ async def main() -> None:
         display_name=args.name.removeprefix("dropin-"),
         host=args.host,
         port=args.port,
+        device_class="standard",
         persistent=True,
     )
     server.register_service()

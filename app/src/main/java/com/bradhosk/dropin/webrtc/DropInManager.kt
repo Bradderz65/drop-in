@@ -1,13 +1,16 @@
 package com.bradhosk.dropin.webrtc
 
+import android.Manifest
+import android.content.Context
 import android.content.Context.AUDIO_SERVICE
-import android.os.Build
+import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
-import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.bradhosk.dropin.DeviceCapability
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
@@ -55,13 +58,17 @@ class DropInManager(
     private var remoteVideoTrack: VideoTrack? = null
     private var isUsingFrontCamera = true
     private var previousAudioMode: Int = audioManager.mode
-    private var previousSpeakerphoneState: Boolean = audioManager.isSpeakerphoneOn
+    private var previousSpeakerphoneState = false
+    private var previousCommunicationDevice: AudioDeviceInfo? = null
     private var audioRouteInitialized = false
-    private var speakerEnabled = true
     private val mainHandler = Handler(Looper.getMainLooper())
     private var connectionLostRunnable: Runnable? = null
     private var connectionLostNotified = false
     private var outboundProfile: VideoQualityProfile = defaultOutboundProfile()
+    private var hasRemoteDescription = false
+    private val pendingRemoteIceCandidates = mutableListOf<IceCandidate>()
+    private var micEnabled = true
+    private var cameraEnabled = true
 
     var onIceCandidateDiscovered: (IceCandidate) -> Unit = {}
     var onRemoteVideoReady: () -> Unit = {}
@@ -127,42 +134,61 @@ class DropInManager(
         applyOutboundEncoding()
     }
 
-    fun startLocalMedia(): Boolean {
+    fun startLocalMedia(): LocalMediaState {
         Log.d(logTag, "startLocalMedia")
-        if (localAudioTrack != null || localVideoTrack != null) return localVideoTrack != null
-
-        audioSource = peerFactory.createAudioSource(MediaConstraints())
-        localAudioTrack = peerFactory.createAudioTrack("localAudio", audioSource)
-
-        val capturer = createCameraCapturer()
-        if (capturer == null) {
-            Log.w(logTag, "startLocalMedia no camera capturer; continuing with audio-only local media")
-            return false
+        if (localAudioTrack == null && hasPermission(Manifest.permission.RECORD_AUDIO)) {
+            runCatching {
+                audioSource = peerFactory.createAudioSource(MediaConstraints())
+                localAudioTrack = peerFactory.createAudioTrack("localAudio", audioSource).apply {
+                    setEnabled(micEnabled)
+                }
+            }.onFailure { error ->
+                Log.w(logTag, "startLocalMedia microphone initialization failed", error)
+                localAudioTrack?.dispose()
+                localAudioTrack = null
+                audioSource?.dispose()
+                audioSource = null
+            }
+        } else if (localAudioTrack == null) {
+            Log.w(logTag, "startLocalMedia microphone permission not granted")
         }
 
-        val helper = SurfaceTextureHelper.create("DropInCaptureThread", eglBase.eglBaseContext)
-        surfaceTextureHelper = helper
-        videoCapturer = capturer
-        videoSource = peerFactory.createVideoSource(false)
-        localVideoTrack = peerFactory.createVideoTrack("localVideo", videoSource)
+        if (localVideoTrack == null && hasPermission(Manifest.permission.CAMERA)) {
+            val capturer = createCameraCapturer()
+            if (capturer == null) {
+                Log.w(logTag, "startLocalMedia no camera capturer; continuing audio-only")
+            } else {
+                val helper = SurfaceTextureHelper.create("DropInCaptureThread", eglBase.eglBaseContext)
+                surfaceTextureHelper = helper
+                videoCapturer = capturer
+                videoSource = peerFactory.createVideoSource(false)
+                localVideoTrack = peerFactory.createVideoTrack("localVideo", videoSource).apply {
+                    setEnabled(cameraEnabled)
+                }
 
-        val profile = outboundProfile
-        runCatching {
-            capturer.initialize(helper, appContext, videoSource?.capturerObserver)
-            capturer.startCapture(profile.captureWidth, profile.captureHeight, profile.captureFps)
-            activeCaptureProfile = profile
-        }.onFailure { error ->
-            Log.w(logTag, "startLocalMedia camera capture failed; continuing audio-only", error)
-            releaseVideoCaptureResources()
+                val profile = outboundProfile
+                runCatching {
+                    capturer.initialize(helper, appContext, videoSource?.capturerObserver)
+                    capturer.startCapture(profile.captureWidth, profile.captureHeight, profile.captureFps)
+                    activeCaptureProfile = profile
+                }.onFailure { error ->
+                    Log.w(logTag, "startLocalMedia camera capture failed; continuing audio-only", error)
+                    releaseVideoCaptureResources()
+                }
+            }
+        } else if (localVideoTrack == null) {
+            Log.w(logTag, "startLocalMedia camera permission not granted")
         }
         rebindLocalVideoSink()
-        return localVideoTrack != null
+        return localMediaState()
     }
 
     fun createPeerConnection(onConnected: () -> Unit) {
         Log.d(logTag, "createPeerConnection existing=${peerConnection != null}")
         if (peerConnection != null) return
         connectionLostNotified = false
+        hasRemoteDescription = false
+        pendingRemoteIceCandidates.clear()
         configureAudioRoute(useSpeaker = true)
         val rtcConfig = PeerConnection.RTCConfiguration(
             listOf(
@@ -225,8 +251,8 @@ class DropInManager(
             },
         )
 
-        localVideoTrack?.setEnabled(true)
-        localAudioTrack?.setEnabled(true)
+        localVideoTrack?.setEnabled(cameraEnabled)
+        localAudioTrack?.setEnabled(micEnabled)
         localVideoTrack?.let { peerConnection?.addTrack(it, listOf("stream")) }
         localAudioTrack?.let { peerConnection?.addTrack(it, listOf("stream")) }
         applyOutboundEncoding()
@@ -239,60 +265,111 @@ class DropInManager(
                 ),
             )
         }
+        if (localAudioTrack == null) {
+            peerConnection?.addTransceiver(
+                MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
+                RtpTransceiver.RtpTransceiverInit(
+                    RtpTransceiver.RtpTransceiverDirection.RECV_ONLY,
+                    listOf("stream"),
+                ),
+            )
+        }
     }
 
-    fun createOffer(onCreated: (SessionDescription) -> Unit) {
-        peerConnection?.createOffer(object : SdpAdapter() {
+    fun createOffer(
+        onFailure: (String) -> Unit = {},
+        onCreated: (SessionDescription) -> Unit,
+    ) {
+        val connection = peerConnection ?: return onFailure("Peer connection is not ready")
+        connection.createOffer(object : SdpAdapter() {
             override fun onCreateSuccess(desc: SessionDescription?) {
-                if (desc == null) return
-                peerConnection?.setLocalDescription(object : SdpAdapter() {
+                if (desc == null) return onFailure("WebRTC returned an empty offer")
+                connection.setLocalDescription(object : SdpAdapter() {
                     override fun onSetSuccess() {
+                        if (peerConnection !== connection) return
                         applyOutboundEncoding()
+                        onCreated(desc)
                     }
+                    override fun onSetFailure(error: String?) = onFailure(error ?: "Could not set local offer")
                 }, desc)
-                onCreated(desc)
             }
+            override fun onCreateFailure(error: String?) = onFailure(error ?: "Could not create offer")
         }, MediaConstraints())
     }
 
-    fun createAnswer(onCreated: (SessionDescription) -> Unit) {
-        peerConnection?.createAnswer(object : SdpAdapter() {
+    fun createAnswer(
+        onFailure: (String) -> Unit = {},
+        onCreated: (SessionDescription) -> Unit,
+    ) {
+        val connection = peerConnection ?: return onFailure("Peer connection is not ready")
+        connection.createAnswer(object : SdpAdapter() {
             override fun onCreateSuccess(desc: SessionDescription?) {
-                if (desc == null) return
-                peerConnection?.setLocalDescription(object : SdpAdapter() {
+                if (desc == null) return onFailure("WebRTC returned an empty answer")
+                connection.setLocalDescription(object : SdpAdapter() {
                     override fun onSetSuccess() {
+                        if (peerConnection !== connection) return
                         applyOutboundEncoding()
+                        onCreated(desc)
                     }
+                    override fun onSetFailure(error: String?) = onFailure(error ?: "Could not set local answer")
                 }, desc)
-                onCreated(desc)
             }
+            override fun onCreateFailure(error: String?) = onFailure(error ?: "Could not create answer")
         }, MediaConstraints())
     }
 
-    fun setRemoteDescription(description: SessionDescription, onSet: () -> Unit = {}) {
-        peerConnection?.setRemoteDescription(object : SdpAdapter() {
+    fun setRemoteDescription(
+        description: SessionDescription,
+        onFailure: (String) -> Unit = {},
+        onSet: () -> Unit = {},
+    ) {
+        val connection = peerConnection ?: return onFailure("Peer connection is not ready")
+        connection.setRemoteDescription(object : SdpAdapter() {
             override fun onSetSuccess() {
+                if (peerConnection !== connection) return
+                hasRemoteDescription = true
+                pendingRemoteIceCandidates.toList().also { pendingRemoteIceCandidates.clear() }
+                    .forEach { candidate ->
+                        if (!connection.addIceCandidate(candidate)) {
+                            Log.w(logTag, "queued remote ICE candidate was rejected")
+                        }
+                    }
                 applyOutboundEncoding()
                 onSet()
             }
+            override fun onSetFailure(error: String?) = onFailure(error ?: "Could not set remote description")
         }, description)
     }
 
     fun addIceCandidate(candidate: IceCandidate) {
-        peerConnection?.addIceCandidate(candidate)
+        val connection = peerConnection ?: return
+        if (!hasRemoteDescription) {
+            if (pendingRemoteIceCandidates.size >= MAX_PENDING_ICE_CANDIDATES) {
+                pendingRemoteIceCandidates.removeAt(0)
+                Log.w(logTag, "remote ICE queue full; dropped oldest candidate")
+            }
+            pendingRemoteIceCandidates += candidate
+            return
+        }
+        if (!connection.addIceCandidate(candidate)) {
+            Log.w(logTag, "remote ICE candidate was rejected")
+        }
     }
 
-    fun toggleMic(enabled: Boolean) {
+    fun setMicEnabled(enabled: Boolean): Boolean {
+        micEnabled = enabled
         localAudioTrack?.setEnabled(enabled)
+        return enabled && localAudioTrack != null
     }
 
-    fun toggleCamera(enabled: Boolean) {
+    fun setCameraEnabled(enabled: Boolean): Boolean {
+        cameraEnabled = enabled
         localVideoTrack?.setEnabled(enabled)
+        return enabled && localVideoTrack != null
     }
 
     fun toggleSpeaker(enabled: Boolean) {
         Log.d(logTag, "toggleSpeaker enabled=$enabled")
-        speakerEnabled = enabled
         configureAudioRoute(useSpeaker = enabled)
     }
 
@@ -342,6 +419,8 @@ class DropInManager(
         peerConnection?.close()
         peerConnection?.dispose()
         peerConnection = null
+        hasRemoteDescription = false
+        pendingRemoteIceCandidates.clear()
         outboundProfile = defaultOutboundProfile()
         restoreAudioRoute()
     }
@@ -411,12 +490,14 @@ class DropInManager(
     private fun configureAudioRoute(useSpeaker: Boolean) {
         if (!audioRouteInitialized) {
             previousAudioMode = audioManager.mode
-            previousSpeakerphoneState = audioManager.isSpeakerphoneOn
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                previousCommunicationDevice = audioManager.communicationDevice
+            } else {
+                previousSpeakerphoneState = legacySpeakerphoneState()
+            }
             audioRouteInitialized = true
         }
-        speakerEnabled = useSpeaker
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        audioManager.isSpeakerphoneOn = useSpeaker
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val targetType = if (useSpeaker) {
                 AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
@@ -438,17 +519,34 @@ class DropInManager(
             } else {
                 Log.w(logTag, "configureAudioRoute no target communication device for useSpeaker=$useSpeaker")
             }
+        } else {
+            setLegacySpeakerphoneState(useSpeaker)
         }
     }
 
     private fun restoreAudioRoute() {
         if (!audioRouteInitialized) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            audioManager.clearCommunicationDevice()
+            val previousDevice = previousCommunicationDevice
+            if (previousDevice != null && audioManager.availableCommunicationDevices.contains(previousDevice)) {
+                audioManager.setCommunicationDevice(previousDevice)
+            } else {
+                audioManager.clearCommunicationDevice()
+            }
+            previousCommunicationDevice = null
+        } else {
+            setLegacySpeakerphoneState(previousSpeakerphoneState)
         }
-        audioManager.isSpeakerphoneOn = previousSpeakerphoneState
         audioManager.mode = previousAudioMode
         audioRouteInitialized = false
+    }
+
+    @Suppress("DEPRECATION")
+    private fun legacySpeakerphoneState(): Boolean = audioManager.isSpeakerphoneOn
+
+    @Suppress("DEPRECATION")
+    private fun setLegacySpeakerphoneState(enabled: Boolean) {
+        audioManager.isSpeakerphoneOn = enabled
     }
 
     private fun stopLocalMedia() {
@@ -563,7 +661,18 @@ class DropInManager(
 
     companion object {
         private const val CONNECTION_LOST_GRACE_MS = 8_000L
+        private const val MAX_PENDING_ICE_CANDIDATES = 128
     }
+
+    private fun hasPermission(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(appContext, permission) == PackageManager.PERMISSION_GRANTED
+
+    private fun localMediaState() = LocalMediaState(
+        hasAudio = localAudioTrack != null,
+        hasVideo = localVideoTrack != null,
+        isAudioEnabled = micEnabled && localAudioTrack != null,
+        isVideoEnabled = cameraEnabled && localVideoTrack != null,
+    )
 
     private open class SdpAdapter : org.webrtc.SdpObserver {
         override fun onCreateSuccess(desc: SessionDescription?) = Unit
@@ -572,3 +681,10 @@ class DropInManager(
         override fun onSetFailure(error: String?) = Unit
     }
 }
+
+data class LocalMediaState(
+    val hasAudio: Boolean,
+    val hasVideo: Boolean,
+    val isAudioEnabled: Boolean,
+    val isVideoEnabled: Boolean,
+)

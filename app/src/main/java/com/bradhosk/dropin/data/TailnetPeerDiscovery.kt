@@ -10,6 +10,9 @@ import android.util.Log
 import com.bradhosk.dropin.DeviceCapability
 import com.bradhosk.dropin.model.PeerDevice
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,11 +20,15 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.Inet4Address
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /** Discovers Drop In peers advertised by the active Android Tailscale VPN routes. */
@@ -38,26 +45,46 @@ class TailnetPeerDiscovery(
         .build()
     private val _peers = MutableStateFlow<List<PeerDevice>>(emptyList())
     private val _localAddress = MutableStateFlow<String?>(null)
+    private val refreshMutex = Mutex()
+    private val probeSemaphore = Semaphore(MAX_CONCURRENT_PROBES)
+    private val vpnNetworks = ConcurrentHashMap.newKeySet<Network>()
     private var periodicRefreshJob: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var started = false
 
     val peers: StateFlow<List<PeerDevice>> = _peers.asStateFlow()
     val localAddress: StateFlow<String?> = _localAddress.asStateFlow()
 
     fun start() {
-        if (networkCallback != null) return
+        if (started) return
+        started = true
         val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = refreshSoon()
-            override fun onLost(network: Network) = refreshSoon()
-            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = refreshSoon()
+            override fun onAvailable(network: Network) {
+                vpnNetworks += network
+                refreshSoon()
+            }
+
+            override fun onLost(network: Network) {
+                vpnNetworks -= network
+                refreshSoon()
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                vpnNetworks += network
+                refreshSoon()
+            }
         }
-        networkCallback = callback
-        connectivityManager.registerNetworkCallback(
-            NetworkRequest.Builder()
-                .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
-                .build(),
-            callback,
-        )
+        runCatching {
+            connectivityManager.registerNetworkCallback(
+                NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+                    .build(),
+                callback,
+            )
+            networkCallback = callback
+        }.onFailure { error ->
+            Log.w(logTag, "could not monitor VPN networks", error)
+        }
         periodicRefreshJob = scope.launch {
             while (isActive) {
                 refresh()
@@ -67,43 +94,53 @@ class TailnetPeerDiscovery(
     }
 
     fun stop() {
+        started = false
         networkCallback?.let { callback ->
             runCatching { connectivityManager.unregisterNetworkCallback(callback) }
         }
         networkCallback = null
         periodicRefreshJob?.cancel()
         periodicRefreshJob = null
+        vpnNetworks.clear()
         _peers.value = emptyList()
         _localAddress.value = null
     }
 
     fun refreshSoon() {
+        if (!started) return
         scope.launch { refresh() }
     }
 
     private suspend fun refresh() {
-        val localAddresses = TailscaleAddresses.all()
-        _localAddress.value = localAddresses.firstOrNull()
-        val candidateHosts = tailnetRouteHosts().filterNot(localAddresses::contains)
-        if (candidateHosts.isEmpty()) {
-            _peers.value = emptyList()
-            return
-        }
-        val peers = buildList {
-            candidateHosts.forEach { host ->
-                fetchPeer(host)?.let(::add)
+        if (!refreshMutex.tryLock()) return
+        try {
+            if (!started) return
+            val localAddresses = TailscaleAddresses.all()
+            _localAddress.value = localAddresses.firstOrNull()
+            val candidateHosts = runCatching { tailnetRouteHosts() }
+                .onFailure { error -> Log.w(logTag, "could not inspect Tailscale routes", error) }
+                .getOrDefault(emptySet())
+                .filterNot(localAddresses::contains)
+            if (candidateHosts.isEmpty()) {
+                _peers.value = emptyList()
+                return
             }
+            val peers = coroutineScope {
+                candidateHosts.map { host ->
+                    async { probeSemaphore.withPermit { fetchPeer(host) } }
+                }.awaitAll().filterNotNull()
+            }
+            if (started) {
+                _peers.value = peers.sortedBy { it.displayName.lowercase() }
+            }
+        } finally {
+            refreshMutex.unlock()
         }
-        _peers.value = peers.sortedBy { it.displayName.lowercase() }
     }
 
     private fun tailnetRouteHosts(): Set<String> =
-        connectivityManager.allNetworks
+        vpnNetworks
             .asSequence()
-            .filter { network ->
-                connectivityManager.getNetworkCapabilities(network)
-                    ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
-            }
             .flatMap { network ->
                 connectivityManager.getLinkProperties(network)
                     ?.routes
@@ -111,7 +148,7 @@ class TailnetPeerDiscovery(
                     .orEmpty()
             }
             .mapNotNull { route ->
-                val destination = route.destination ?: return@mapNotNull null
+                val destination = route.destination
                 val address = destination.address as? Inet4Address ?: return@mapNotNull null
                 val host = address.hostAddress?.substringBefore('%').orEmpty()
                 host.takeIf {
@@ -131,7 +168,7 @@ class TailnetPeerDiscovery(
                 if (!response.isSuccessful) return@use null
                 val identity = json.decodeFromString(
                     TailnetPeerIdentity.serializer(),
-                    response.body?.string().orEmpty(),
+                    response.body.string(),
                 )
                 if (identity.serviceName.isBlank() || identity.port <= 0) return@use null
                 PeerDevice(
@@ -148,10 +185,10 @@ class TailnetPeerDiscovery(
     }
 
     private companion object {
-        const val DEFAULT_SIGNALING_PORT = 8989
         const val IPV4_HOST_PREFIX_LENGTH = 32
         const val CONNECT_TIMEOUT_MS = 1_500L
         const val READ_TIMEOUT_MS = 1_500L
         const val REFRESH_INTERVAL_MS = 15_000L
+        const val MAX_CONCURRENT_PROBES = 8
     }
 }

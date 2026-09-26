@@ -12,12 +12,12 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.ProcessLifecycleOwner
-import com.bradhosk.dropin.DeviceCapability
+import com.bradhosk.dropin.data.DEFAULT_SIGNALING_PORT
 import com.bradhosk.dropin.data.DropInRuntime
-import com.bradhosk.dropin.data.IceCandidatePayload
 import com.bradhosk.dropin.data.PeerSignalingClient
 import com.bradhosk.dropin.data.SignalEnvelope
 import com.bradhosk.dropin.data.SignalType
+import com.bradhosk.dropin.data.toSignalEnvelope
 import com.bradhosk.dropin.webrtc.DropInManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -120,8 +120,12 @@ class DropInBackgroundService : Service() {
         Log.d(logTag, "background service onDestroy")
         serviceScope.coroutineContext.cancel()
         endBackgroundCall()
+        signalingClient.close()
         dropInManager?.release()
         dropInManager = null
+        if (::runtime.isInitialized) {
+            runtime.stop()
+        }
         super.onDestroy()
     }
 
@@ -253,7 +257,7 @@ class DropInBackgroundService : Service() {
             dropInManager = manager
             manager.onIceCandidateDiscovered = { candidate ->
                 activePeerServiceName?.let { target ->
-                    val signal = candidate.toSignalEnvelope(target)
+                    val signal = candidate.toSignalEnvelope(runtime.localPeerId, target)
                     signalingClient.send(signal)
                     runtime.sendLocal(signal)
                 }
@@ -270,12 +274,12 @@ class DropInBackgroundService : Service() {
         isAnsweringOffer = true
         activePeerServiceName = offer.from
         val manager = requireManager()
-        manager.prepareForCall(offer.deviceClass ?: DeviceCapability.CLASS_STANDARD)
+        manager.prepareForCall(offer.deviceClass.orEmpty())
         manager.endCall()
         signalingClient.disconnect()
 
-        val hasLocalCamera = manager.startLocalMedia()
-        Log.d(logTag, "background auto-answer localCamera=$hasLocalCamera")
+        val media = manager.startLocalMedia()
+        Log.d(logTag, "background auto-answer localAudio=${media.hasAudio} localVideo=${media.hasVideo}")
         if (!offer.remoteHost.isNullOrBlank()) {
             signalingClient.connect(offer.remoteHost, DEFAULT_SIGNALING_PORT)
         } else {
@@ -286,8 +290,19 @@ class DropInBackgroundService : Service() {
             Log.d(logTag, "background auto-answer connected peer=${offer.from}")
         }
         val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, offer.sdp.orEmpty())
-        manager.setRemoteDescription(remoteOffer) {
-            manager.createAnswer { answer ->
+        manager.setRemoteDescription(
+            description = remoteOffer,
+            onFailure = { error ->
+                Log.w(logTag, "background auto-answer could not set offer: $error")
+                endBackgroundCall()
+            },
+        ) {
+            manager.createAnswer(
+                onFailure = { error ->
+                    Log.w(logTag, "background auto-answer could not create answer: $error")
+                    endBackgroundCall()
+                },
+            ) { answer ->
                 Log.d(logTag, "background auto-answer sending answer to=${offer.from}")
                 val response = SignalEnvelope(
                     type = SignalType.ANSWER,
@@ -311,31 +326,12 @@ class DropInBackgroundService : Service() {
         dropInManager?.endCall()
     }
 
-    private fun IceCandidate.toSignalEnvelope(target: String) = SignalEnvelope(
-        type = SignalType.ICE,
-        from = runtime.localPeerId,
-        to = target,
-        candidate = IceCandidatePayload(
-            sdpMid = sdpMid,
-            sdpMLineIndex = sdpMLineIndex,
-            sdpCandidate = sdp,
-        ),
-    )
-
-    private fun SessionDescription.Type.canonicalForm(): String = when (this) {
-        SessionDescription.Type.OFFER -> "offer"
-        SessionDescription.Type.ANSWER -> "answer"
-        SessionDescription.Type.PRANSWER -> "pranswer"
-        SessionDescription.Type.ROLLBACK -> "rollback"
-    }
-
     companion object {
         private const val CHANNEL_ID = "dropin_background"
         private const val INCOMING_CHANNEL_ID = "dropin_incoming_calls"
         private const val NOTIFICATION_ID = 1001
         private const val INCOMING_NOTIFICATION_ID = 1002
         private const val AUTO_ANSWER_UI_GRACE_MS = 300L
-        private const val DEFAULT_SIGNALING_PORT = 8989
         private const val WAKE_LOCK_TIMEOUT_MS = 10_000L
 
         fun start(context: Context) {

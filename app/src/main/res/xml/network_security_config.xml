@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<network-security-config>
+<!-- Local peer discovery and signaling require HTTP/WebSocket access to arbitrary LAN and tailnet IPs. -->
+<network-security-config xmlns:tools="http://schemas.android.com/tools"
+    tools:ignore="InsecureBaseConfiguration">
     <base-config cleartextTrafficPermitted="true" />
 </network-security-config>

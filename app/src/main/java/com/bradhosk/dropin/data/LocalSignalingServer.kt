@@ -28,7 +28,7 @@ class LocalSignalingServer(
     val port: Int
         get() = server?.listeningPort ?: 0
 
-    fun start(preferredPort: Int = 8989) {
+    fun start(preferredPort: Int = DEFAULT_SIGNALING_PORT) {
         if (server != null) return
         val ports = listOf(preferredPort, 0).distinct()
         for (port in ports) {
@@ -63,17 +63,28 @@ class LocalSignalingServer(
     }
 
     fun send(message: SignalEnvelope) {
+        if (!message.isValid()) {
+            Log.w(logTag, "local signaling refused invalid type=${message.type}")
+            return
+        }
         Log.d(logTag, "local signaling send type=${message.type} to=${message.to}")
         val encoded = json.encodeToString(SignalEnvelope.serializer(), message)
         val targetSocket = message.to?.let(socketsByPeer::get)
-        val recipients = targetSocket?.let(::listOf) ?: sockets.toList()
+        val recipients = when {
+            targetSocket != null -> listOf(targetSocket)
+            message.to == null -> sockets.toList()
+            else -> emptyList()
+        }
         if (recipients.isEmpty()) {
             Log.w(logTag, "local signaling no websocket recipients for type=${message.type} to=${message.to}")
             return
         }
         recipients.forEach { socket ->
             runCatching { socket.send(encoded) }
-                .onFailure { Log.w(logTag, "local signaling send failed", it) }
+                .onFailure {
+                    Log.w(logTag, "local signaling send failed", it)
+                    removeSocket(socket)
+                }
         }
     }
 
@@ -92,10 +103,10 @@ class LocalSignalingServer(
                 uri == "/api/identity" && session.method == Method.GET -> handleIdentity()
                 uri == "/api/registry/register" && session.method == Method.POST ->
                     handleRegistryRegister(session)
-                uri.startsWith("/api/registry/peers") && session.method == Method.GET ->
+                uri == "/api/registry/peers" && session.method == Method.GET ->
                     handleRegistryPeers(session)
                 else ->
-                    newFixedLengthResponse(Response.Status.OK, NanoHTTPD.MIME_PLAINTEXT, "DropIn signaling server")
+                    newFixedLengthResponse(Response.Status.NOT_FOUND, NanoHTTPD.MIME_PLAINTEXT, "Not found")
             }
         }
 
@@ -110,7 +121,14 @@ class LocalSignalingServer(
         }
 
         private fun handleRegistryRegister(session: IHTTPSession): Response {
-            val body = readBody(session)
+            val body = runCatching { readBody(session) }.getOrElse { error ->
+                Log.w(logTag, "registry request body could not be read", error)
+                return newFixedLengthResponse(
+                    Response.Status.BAD_REQUEST,
+                    MIME_JSON,
+                    """{"error":"invalid request body"}""",
+                )
+            }
             val remoteHost = session.remoteIpAddress.orEmpty()
             val ok = registry.registerFromJson(body, remoteHost)
             return if (ok) {
@@ -147,14 +165,17 @@ class LocalSignalingServer(
 
         override fun onClose(code: WebSocketFrame.CloseCode?, reason: String?, initiatedByRemote: Boolean) {
             Log.d(logTag, "local signaling websocket onClose code=$code reason=$reason initiatedByRemote=$initiatedByRemote")
-            sockets -= this
-            socketsByPeer.entries.removeIf { it.value === this }
+            removeSocket(this)
         }
 
         override fun onMessage(message: WebSocketFrame) {
             runCatching {
                 json.decodeFromString(SignalEnvelope.serializer(), message.textPayload)
             }.onSuccess { decoded ->
+                if (!decoded.isValid()) {
+                    Log.w(logTag, "local signaling ignored invalid type=${decoded.type}")
+                    return@onSuccess
+                }
                 val signal = decoded.copy(remoteHost = handshakeRequest.remoteIpAddress)
                 socketsByPeer[signal.from] = this
                 Log.d(logTag, "local signaling receive type=${signal.type} from=${signal.from} to=${signal.to} remote=${signal.remoteHost}")
@@ -167,7 +188,13 @@ class LocalSignalingServer(
         override fun onPong(pong: WebSocketFrame) = Unit
         override fun onException(exception: IOException) {
             Log.e(logTag, "local signaling websocket exception", exception)
+            removeSocket(this)
         }
+    }
+
+    private fun removeSocket(socket: SignalingSocket) {
+        sockets -= socket
+        socketsByPeer.entries.removeIf { it.value === socket }
     }
 
     private companion object {

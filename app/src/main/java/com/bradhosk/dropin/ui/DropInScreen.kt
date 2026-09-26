@@ -60,8 +60,8 @@ import androidx.compose.material.icons.rounded.SignalCellularAlt2Bar
 import androidx.compose.material.icons.rounded.SwapHoriz
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material.icons.rounded.VideocamOff
-import androidx.compose.material.icons.rounded.VolumeOff
-import androidx.compose.material.icons.rounded.VolumeUp
+import androidx.compose.material.icons.automirrored.rounded.VolumeOff
+import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -93,9 +93,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -107,7 +107,7 @@ import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
-import com.bradhosk.dropin.DeviceOrientation
+import com.bradhosk.dropin.DeviceCapability
 import com.bradhosk.dropin.model.PeerDevice
 import kotlin.math.min
 import kotlinx.coroutines.delay
@@ -141,15 +141,14 @@ private fun ConnectionQuality.icon(): ImageVector = when (this) {
 
 @Composable
 private fun isWideLayout(): Boolean {
-    val configuration = LocalConfiguration.current
-    return configuration.screenWidthDp > configuration.screenHeightDp ||
-        configuration.screenWidthDp >= 720
+    val windowSize = LocalWindowInfo.current.containerDpSize
+    return windowSize.width > windowSize.height || windowSize.width >= 720.dp
 }
 
 @Composable
 private fun scrollBottomPadding(): Dp {
     val safeBottom = WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding()
-    val lockLandscape = DeviceOrientation.shouldLockLandscape(LocalContext.current)
+    val lockLandscape = DeviceCapability.shouldLockLandscape(LocalContext.current)
     val minBottom = if (lockLandscape) 56.dp else 16.dp
     return safeBottom.coerceAtLeast(minBottom) + 24.dp
 }
@@ -213,7 +212,7 @@ fun DropInScreen(
     val haptic = LocalHapticFeedback.current
     val context = LocalContext.current
     val wideLayout = isWideLayout()
-    val lockLandscape = remember(context) { DeviceOrientation.shouldLockLandscape(context) }
+    val lockLandscape = remember(context) { DeviceCapability.shouldLockLandscape(context) }
     val pinControls = (lockLandscape || wideLayout) && !(isFullscreen && state.isInCall)
 
     LaunchedEffect(state.savedTailnetHost) { tailnetHostDraft = state.savedTailnetHost }
@@ -829,7 +828,7 @@ private fun TabletEssentialCallControls(
                 .defaultMinSize(minHeight = 92.dp),
         )
         LabeledActionButton(
-            icon = if (state.isSpeakerOn) Icons.Rounded.VolumeUp else Icons.Rounded.VolumeOff,
+            icon = if (state.isSpeakerOn) Icons.AutoMirrored.Rounded.VolumeUp else Icons.AutoMirrored.Rounded.VolumeOff,
             label = if (state.isSpeakerOn) "Speaker" else "Earpiece",
             isActive = state.isSpeakerOn,
             onClick = {
@@ -1357,10 +1356,10 @@ private fun CallStage(
 
 @Composable
 private fun inCallVideoMaxHeight(): Dp {
-    val configuration = LocalConfiguration.current
-    val landscape = configuration.screenWidthDp > configuration.screenHeightDp
+    val windowSize = LocalWindowInfo.current.containerDpSize
+    val landscape = windowSize.width > windowSize.height
     val heightFraction = if (landscape) 0.34f else 0.32f
-    return min(configuration.screenHeightDp * heightFraction, 280f).dp
+    return min(windowSize.height.value * heightFraction, 280f).dp
 }
 
 @Composable
@@ -1417,7 +1416,7 @@ private fun InCallControlBar(
             },
         )
         ControlButton(
-            icon = if (state.isSpeakerOn) Icons.Rounded.VolumeUp else Icons.Rounded.VolumeOff,
+            icon = if (state.isSpeakerOn) Icons.AutoMirrored.Rounded.VolumeUp else Icons.AutoMirrored.Rounded.VolumeOff,
             label = "Speaker",
             isActive = state.isSpeakerOn,
             onClick = {

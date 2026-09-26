@@ -44,7 +44,7 @@ class PeerSignalingClient(
             require(host.isNotBlank()) { "Peer host is blank" }
             require(port in 1..65535) { "Peer port is invalid: $port" }
             Request.Builder()
-                .url("ws://$host:$port")
+                .url(webSocketUrl(host, port))
                 .build()
         }.getOrElse { error ->
             synchronized(lock) {
@@ -97,6 +97,10 @@ class PeerSignalingClient(
                     runCatching {
                         json.decodeFromString(SignalEnvelope.serializer(), text)
                     }.onSuccess { message ->
+                        if (!message.isValid()) {
+                            Log.w(logTag, "signaling ignored invalid type=${message.type}")
+                            return@onSuccess
+                        }
                         Log.d(logTag, "signaling receive type=${message.type} from=${message.from} to=${message.to}")
                         _events.tryEmit(message)
                     }.onFailure { error ->
@@ -150,6 +154,10 @@ class PeerSignalingClient(
     }
 
     fun send(message: SignalEnvelope) {
+        if (!message.isValid()) {
+            Log.w(logTag, "signaling refused invalid type=${message.type}")
+            return
+        }
         val encoded = json.encodeToString(SignalEnvelope.serializer(), message)
         val activeSocket = synchronized(lock) {
             if (isConnected) {
@@ -164,8 +172,11 @@ class PeerSignalingClient(
             }
         }
         if (activeSocket != null) {
-            activeSocket.send(encoded)
-            Log.d(logTag, "signaling send type=${message.type}")
+            if (activeSocket.send(encoded)) {
+                Log.d(logTag, "signaling send type=${message.type}")
+            } else {
+                Log.w(logTag, "signaling send rejected type=${message.type}")
+            }
         } else {
             Log.d(logTag, "signaling queue type=${message.type}")
         }
@@ -182,8 +193,21 @@ class PeerSignalingClient(
         socketToClose?.close(1000, "bye")
     }
 
+    fun close() {
+        disconnect()
+        httpClient.dispatcher.executorService.shutdown()
+        httpClient.connectionPool.evictAll()
+        httpClient.cache?.close()
+    }
+
     private companion object {
         const val MAX_PENDING_MESSAGES = 64
+
+        fun webSocketUrl(host: String, port: Int): String {
+            val normalizedHost = host.trim().removeSurrounding("[", "]")
+            val urlHost = if (':' in normalizedHost) "[$normalizedHost]" else normalizedHost
+            return "ws://$urlHost:$port/"
+        }
     }
 }
 

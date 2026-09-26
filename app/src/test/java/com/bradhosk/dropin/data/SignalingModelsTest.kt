@@ -2,7 +2,9 @@ package com.bradhosk.dropin.data
 
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SignalingModelsTest {
@@ -54,5 +56,20 @@ class SignalingModelsTest {
         assertEquals(0, decoded.candidate?.sdpMLineIndex)
         assertEquals("candidate:1 udp 2122260223 192.168.1.2 54400 typ host", decoded.candidate?.sdpCandidate)
         assertNull(decoded.to)
+    }
+
+    @Test
+    fun validatesRequiredPayloadForEachSignalType() {
+        assertTrue(SignalEnvelope(SignalType.HANGUP, from = "dropin-phone").isValid())
+        assertTrue(SignalEnvelope(SignalType.OFFER, from = "dropin-phone", sdp = "v=0").isValid())
+        assertFalse(SignalEnvelope(SignalType.OFFER, from = "dropin-phone").isValid())
+        assertFalse(SignalEnvelope(SignalType.HANGUP, from = "").isValid())
+        assertFalse(
+            SignalEnvelope(
+                type = SignalType.ICE,
+                from = "dropin-phone",
+                candidate = IceCandidatePayload("0", -1, "candidate"),
+            ).isValid(),
+        )
     }
 }

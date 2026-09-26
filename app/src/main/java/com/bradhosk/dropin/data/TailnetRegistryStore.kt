@@ -28,22 +28,22 @@ class TailnetRegistryStore(
                 port = port,
                 deviceClass = deviceClass,
                 persistent = persistent,
-                lastSeenEpochSeconds = System.currentTimeMillis() / 1000,
+                lastSeenMonotonicMs = monotonicTimeMs(),
             )
         }
     }
 
     fun peers(exclude: String? = null): List<TailnetPeerRecord> {
-        val now = System.currentTimeMillis() / 1000
+        val now = monotonicTimeMs()
         synchronized(lock) {
             val staleKeys = records.filterValues { record ->
-                !record.persistent && now - record.lastSeenEpochSeconds > REGISTRY_TTL_SECONDS
+                !record.persistent && now - record.lastSeenMonotonicMs > REGISTRY_TTL_MS
             }.keys
             staleKeys.forEach(records::remove)
             return records.values
                 .filter { it.serviceName != exclude }
                 .sortedBy { it.displayName.lowercase() }
-                .map { it.copy(persistent = false, lastSeenEpochSeconds = 0) }
+                .map { it.copy(persistent = false, lastSeenMonotonicMs = 0) }
         }
     }
 
@@ -70,8 +70,10 @@ class TailnetRegistryStore(
     }
 
     private companion object {
-        const val REGISTRY_TTL_SECONDS = 45L
+        const val REGISTRY_TTL_MS = 45_000L
         val VALID_PORT_RANGE = 1..65535
+
+        fun monotonicTimeMs(): Long = System.nanoTime() / 1_000_000
     }
 }
 
@@ -100,7 +102,7 @@ data class TailnetPeerRecord(
     @kotlinx.serialization.Transient
     val persistent: Boolean = false,
     @kotlinx.serialization.Transient
-    val lastSeenEpochSeconds: Long = 0,
+    val lastSeenMonotonicMs: Long = 0,
 )
 
 @Serializable

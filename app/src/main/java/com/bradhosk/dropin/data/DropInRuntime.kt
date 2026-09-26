@@ -2,10 +2,13 @@ package com.bradhosk.dropin.data
 
 import android.content.Context
 import android.util.Log
+import androidx.core.content.edit
 import com.bradhosk.dropin.DeviceCapability
 import com.bradhosk.dropin.model.PeerDevice
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,13 +42,14 @@ class DropInRuntime private constructor(
     private val effectiveRegistryUrl: StateFlow<String> = combine(_tailnetRegistryUrl, _savedTailnetHost) { registryUrl, savedHost ->
         registryUrl.trim().trimEnd('/').ifBlank {
             val host = savedHost.trim()
-            if (host.isBlank()) "" else "http://$host:$DEFAULT_REGISTRY_PORT"
+            if (host.isBlank()) "" else "http://$host:$DEFAULT_SIGNALING_PORT"
         }
     }.stateIn(scope, SharingStarted.Eagerly, "")
     private val _nonOfferSignals = MutableSharedFlow<SignalEnvelope>(extraBufferCapacity = 32)
     private val _incomingOffers = MutableSharedFlow<SignalEnvelope>(extraBufferCapacity = 32)
     private val _pendingOffer = MutableStateFlow<SignalEnvelope?>(null)
     private var started = false
+    private var signalCollectionJob: Job? = null
 
     val deviceName: String = localServiceName.removePrefix("dropin-")
     val localPeerId: String = localServiceName
@@ -65,7 +69,7 @@ class DropInRuntime private constructor(
                         serviceName = "dropin-tailnet-saved",
                         displayName = "Saved Tailscale Peer",
                         host = savedHost,
-                        port = signalingServer.port.takeIf { it > 0 } ?: DEFAULT_REGISTRY_PORT,
+                        port = signalingServer.port.takeIf { it > 0 } ?: DEFAULT_SIGNALING_PORT,
                     ),
                 )
             }
@@ -92,11 +96,7 @@ class DropInRuntime private constructor(
     fun start() {
         if (started) return
         started = true
-        signalingServer.start()
-        peerDiscovery.start(signalingServer.port)
-        tailnetPeerDiscovery.start()
-        startTailnetRegistry()
-        scope.launch {
+        signalCollectionJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
             signalingServer.events.collect { signal ->
                 Log.d(logTag, "runtime signal type=${signal.type} from=${signal.from} to=${signal.to}")
                 if (signal.type == SignalType.OFFER) {
@@ -107,6 +107,10 @@ class DropInRuntime private constructor(
                 }
             }
         }
+        signalingServer.start()
+        peerDiscovery.start(signalingServer.port)
+        tailnetPeerDiscovery.start()
+        startTailnetRegistry()
     }
 
     fun stop() {
@@ -116,14 +120,14 @@ class DropInRuntime private constructor(
         peerDiscovery.stop()
         tailnetPeerDiscovery.stop()
         tailnetRegistry.stop()
+        signalCollectionJob?.cancel()
+        signalCollectionJob = null
         _pendingOffer.value = null
     }
 
-    /** Re-trigger NSD and Tailnet discovery. */
+    /** Refresh network-backed discovery; NSD remains active and reports changes continuously. */
     fun refreshPeers() {
         if (!started) return
-        peerDiscovery.stop()
-        peerDiscovery.start(signalingServer.port)
         tailnetPeerDiscovery.refreshSoon()
         tailnetRegistry.stop()
         startTailnetRegistry()
@@ -141,14 +145,14 @@ class DropInRuntime private constructor(
         val normalized = url.trim().trimEnd('/')
         if (_tailnetRegistryUrl.value == normalized) return
         _tailnetRegistryUrl.value = normalized
-        preferences.edit().putString(KEY_TAILNET_REGISTRY_URL, normalized).apply()
+        preferences.edit { putString(KEY_TAILNET_REGISTRY_URL, normalized) }
     }
 
     fun updateSavedTailnetHost(host: String) {
         val normalized = host.trim()
         if (_savedTailnetHost.value == normalized) return
         _savedTailnetHost.value = normalized
-        preferences.edit().putString(KEY_SAVED_TAILNET_HOST, normalized).apply()
+        preferences.edit { putString(KEY_SAVED_TAILNET_HOST, normalized) }
     }
 
     private fun startTailnetRegistry() {
@@ -169,7 +173,6 @@ class DropInRuntime private constructor(
         private const val PREFS_NAME = "dropin_runtime"
         private const val KEY_SAVED_TAILNET_HOST = "saved_tailnet_host"
         private const val KEY_TAILNET_REGISTRY_URL = "tailnet_registry_url"
-        private const val DEFAULT_REGISTRY_PORT = 8989
         @Volatile
         private var instance: DropInRuntime? = null
 

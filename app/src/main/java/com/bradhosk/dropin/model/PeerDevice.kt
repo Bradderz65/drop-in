@@ -5,6 +5,5 @@ data class PeerDevice(
     val displayName: String,
     val host: String,
     val port: Int,
-    val isReachable: Boolean = true,
     val deviceClass: String = "standard",
 )

@@ -16,10 +16,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.util.concurrent.TimeUnit
 
 class TailnetRegistryDiscovery(
@@ -28,8 +30,8 @@ class TailnetRegistryDiscovery(
 ) {
     private val logTag = "DropInApp"
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS)
+        .connectTimeout(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .readTimeout(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
     private val _peers = MutableStateFlow<List<PeerDevice>>(emptyList())
     private var syncJob: Job? = null
@@ -64,9 +66,7 @@ class TailnetRegistryDiscovery(
                             host = hostProvider(),
                             deviceClass = deviceClassProvider(),
                         )
-                        fetchPeers(baseUrl, localServiceName)?.let { discoveredPeers ->
-                            _peers.value = discoveredPeers
-                        }
+                        _peers.value = fetchPeers(baseUrl, localServiceName).orEmpty()
                     }
                     delay(SYNC_INTERVAL_MS)
                 }
@@ -101,7 +101,7 @@ class TailnetRegistryDiscovery(
         withContext(Dispatchers.IO) {
             runCatching {
                 val request = Request.Builder()
-                    .url("$baseUrl/api/registry/register")
+                    .url(registryEndpoint(baseUrl, "register"))
                     .post(payload.toRequestBody(JSON_MEDIA_TYPE))
                     .build()
                 httpClient.newCall(request).execute().use { response ->
@@ -119,14 +119,18 @@ class TailnetRegistryDiscovery(
         withContext(Dispatchers.IO) {
             runCatching {
                 val request = Request.Builder()
-                    .url("$baseUrl/api/registry/peers?exclude=$localServiceName")
+                    .url(
+                        registryEndpoint(baseUrl, "peers").newBuilder()
+                            .addQueryParameter("exclude", localServiceName)
+                            .build(),
+                    )
                     .get()
                     .build()
                 httpClient.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) {
                         throw IllegalStateException("registry peers failed ${response.code}")
                     }
-                    val body = response.body?.string().orEmpty()
+                    val body = response.body.string()
                     json.decodeFromString(TailnetPeersResponse.serializer(), body).peers.map { peer ->
                         PeerDevice(
                             serviceName = peer.serviceName,
@@ -142,8 +146,15 @@ class TailnetRegistryDiscovery(
             }.getOrNull()
         }
 
+    private fun registryEndpoint(baseUrl: String, operation: String): HttpUrl =
+        baseUrl.toHttpUrl().newBuilder()
+            .addPathSegments("api/registry")
+            .addPathSegment(operation)
+            .build()
+
     companion object {
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
+        private const val REQUEST_TIMEOUT_SECONDS = 5L
         private const val SYNC_INTERVAL_MS = 15_000L
     }
 }

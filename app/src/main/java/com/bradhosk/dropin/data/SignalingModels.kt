@@ -3,6 +3,8 @@ package com.bradhosk.dropin.data
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
+const val DEFAULT_SIGNALING_PORT = 8989
+
 @Serializable
 data class SignalEnvelope(
     val type: SignalType,
@@ -36,3 +38,16 @@ data class IceCandidatePayload(
     val sdpMLineIndex: Int,
     val sdpCandidate: String,
 )
+
+fun SignalEnvelope.isValid(): Boolean {
+    if (from.isBlank()) return false
+    return when (type) {
+        SignalType.OFFER,
+        SignalType.ANSWER,
+        -> !sdp.isNullOrBlank()
+        SignalType.ICE -> candidate?.let {
+            it.sdpMLineIndex >= 0 && it.sdpCandidate.isNotBlank()
+        } == true
+        SignalType.HANGUP -> true
+    }
+}

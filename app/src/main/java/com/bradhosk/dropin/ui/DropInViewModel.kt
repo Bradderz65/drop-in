@@ -5,12 +5,14 @@ import android.content.Context
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.bradhosk.dropin.data.IceCandidatePayload
+import com.bradhosk.dropin.data.DEFAULT_SIGNALING_PORT
 import com.bradhosk.dropin.data.DropInRuntime
 import com.bradhosk.dropin.data.PeerSignalingClient
 import com.bradhosk.dropin.data.PeerSignalingStatus
 import com.bradhosk.dropin.data.SignalEnvelope
 import com.bradhosk.dropin.data.SignalType
+import com.bradhosk.dropin.data.isValid
+import com.bradhosk.dropin.data.toSignalEnvelope
 import com.bradhosk.dropin.effectiveDeviceClass
 import com.bradhosk.dropin.model.PeerDevice
 import com.bradhosk.dropin.webrtc.DropInManager
@@ -18,14 +20,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.builtins.ListSerializer
-import kotlinx.serialization.json.Json
 import org.webrtc.IceCandidate
 import org.webrtc.SessionDescription
 
@@ -78,12 +75,6 @@ class DropInViewModel(
     private val _callMetrics = MutableStateFlow(CallMetrics())
     val callMetrics: StateFlow<CallMetrics> = _callMetrics.asStateFlow()
 
-    val peers = runtime.peers.stateIn(
-        viewModelScope,
-        SharingStarted.WhileSubscribed(5_000),
-        emptyList(),
-    )
-
     init {
         runtime.start()
         dropInManager.onRemoteVideoReady = {
@@ -92,8 +83,9 @@ class DropInViewModel(
         }
         dropInManager.onIceCandidateDiscovered = { candidate ->
             _uiState.value.selectedPeer?.let { peer ->
-                signalingClient.send(candidate.toSignalEnvelope(peer.serviceName))
-                runtime.sendLocal(candidate.toSignalEnvelope(peer.serviceName))
+                val signal = candidate.toSignalEnvelope(deviceName, peer.serviceName)
+                signalingClient.send(signal)
+                runtime.sendLocal(signal)
             }
         }
         dropInManager.onConnectionLost = {
@@ -154,10 +146,17 @@ class DropInViewModel(
     }
 
     fun startLocalMedia() {
-        val hasLocalCamera = dropInManager.startLocalMedia()
+        val media = dropInManager.startLocalMedia()
+        val availability = when {
+            media.hasAudio && media.hasVideo -> "Ready for drop in"
+            media.hasAudio -> "Ready for drop in; no local camera"
+            media.hasVideo -> "Ready for drop in; no local microphone"
+            else -> "Ready to receive; camera and microphone unavailable"
+        }
         _uiState.value = _uiState.value.copy(
-            isCameraOn = hasLocalCamera,
-            status = if (hasLocalCamera) "Ready for drop in" else "Ready for drop in; no local camera",
+            isMicOn = media.isAudioEnabled,
+            isCameraOn = media.isVideoEnabled,
+            status = availability,
         )
     }
 
@@ -183,7 +182,9 @@ class DropInViewModel(
             onCallConnected(peer)
         }
         signalingClient.connect(peer.host, peer.port)
-        dropInManager.createOffer { offer ->
+        dropInManager.createOffer(
+            onFailure = { error -> failPendingCall("Could not create call: $error") },
+        ) { offer ->
             signalingClient.send(
                 SignalEnvelope(
                     type = SignalType.OFFER,
@@ -195,19 +196,7 @@ class DropInViewModel(
                 ),
             )
         }
-        connectTimeoutJob?.cancel()
-        connectTimeoutJob = viewModelScope.launch {
-            delay(CONNECTION_TIMEOUT_MS)
-            if (!_uiState.value.isInCall && _uiState.value.selectedPeer?.serviceName == peer.serviceName) {
-                Log.w(logTag, "connect timeout peer=${peer.displayName}")
-                signalingClient.disconnect()
-                dropInManager.endCall()
-                _uiState.value = _uiState.value.copy(
-                    selectedPeer = null,
-                    status = "Could not connect to ${peer.displayName}",
-                )
-            }
-        }
+        startConnectTimeout(peer)
     }
 
     fun hangUp(notifyPeer: Boolean = true) {
@@ -238,13 +227,11 @@ class DropInViewModel(
     }
 
     fun setMicEnabled(enabled: Boolean) {
-        dropInManager.toggleMic(enabled)
-        _uiState.value = _uiState.value.copy(isMicOn = enabled)
+        _uiState.value = _uiState.value.copy(isMicOn = dropInManager.setMicEnabled(enabled))
     }
 
     fun setCameraEnabled(enabled: Boolean) {
-        dropInManager.toggleCamera(enabled)
-        _uiState.value = _uiState.value.copy(isCameraOn = enabled)
+        _uiState.value = _uiState.value.copy(isCameraOn = dropInManager.setCameraEnabled(enabled))
     }
 
     fun setSpeakerEnabled(enabled: Boolean) {
@@ -281,7 +268,7 @@ class DropInViewModel(
         _uiState.value = _uiState.value.copy(isRemotePrimary = remotePrimary)
     }
 
-    /** Pull-to-refresh: restarts NSD/tailnet discovery. */
+    /** Pull-to-refresh: refreshes tailnet sources while continuous NSD remains active. */
     fun refreshPeers() {
         _uiState.value = _uiState.value.copy(
             isRefreshing = true,
@@ -398,6 +385,10 @@ class DropInViewModel(
     // ── Signal handling ──────────────────────────────────────
     private fun handleSignal(signal: SignalEnvelope) {
         Log.d(logTag, "handleSignal type=${signal.type} from=${signal.from} to=${signal.to}")
+        if (!signal.isValid()) {
+            Log.w(logTag, "ignoring invalid signal type=${signal.type} from=${signal.from}")
+            return
+        }
         if (signal.to != null && signal.to != deviceName && signal.to != "dropin-tailnet-saved") {
             Log.d(logTag, "ignoring signal addressed to=${signal.to}")
             return
@@ -431,7 +422,7 @@ class DropInViewModel(
     }
 
     private fun handleOffer(signal: SignalEnvelope) {
-        val peer = peers.value.firstOrNull { it.serviceName == signal.from } ?: run {
+        val peer = _uiState.value.devices.firstOrNull { it.serviceName == signal.from } ?: run {
             val tailnetHost = runtime.savedTailnetHost.value.trim()
             val isTailnetTarget = signal.to == "dropin-tailnet-saved"
             val fallbackHost = when {
@@ -444,12 +435,12 @@ class DropInViewModel(
                 serviceName = signal.from,
                 displayName = signal.from.removePrefix("dropin-"),
                 host = fallbackHost,
-                port = _uiState.value.selectedPeer?.port ?: 8989,
+                port = _uiState.value.selectedPeer?.port ?: DEFAULT_SIGNALING_PORT,
             ).also {
                 Log.w(
                     logTag,
                     "handleOffer using fallback peer serviceName=${signal.from}; " +
-                        "knownPeers=${peers.value.map { known -> known.serviceName }}; " +
+                        "knownPeers=${_uiState.value.devices.map { known -> known.serviceName }}; " +
                         "tailnetTarget=$isTailnetTarget tailnetHost='$tailnetHost' remoteHost='${signal.remoteHost}' chosenHost='$fallbackHost'",
                 )
             }
@@ -476,9 +467,15 @@ class DropInViewModel(
             connectTimeoutJob?.cancel()
             onCallConnected(peer)
         }
+        startConnectTimeout(peer)
         val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, signal.sdp.orEmpty())
-        dropInManager.setRemoteDescription(remoteOffer) {
-            dropInManager.createAnswer { answer ->
+        dropInManager.setRemoteDescription(
+            description = remoteOffer,
+            onFailure = { error -> failPendingCall("Could not accept call: $error") },
+        ) {
+            dropInManager.createAnswer(
+                onFailure = { error -> failPendingCall("Could not answer call: $error") },
+            ) { answer ->
                 Log.d(logTag, "sending answer to=${peer.serviceName}")
                 val response = SignalEnvelope(
                     type = SignalType.ANSWER,
@@ -496,18 +493,15 @@ class DropInViewModel(
 
     private fun handleAnswer(signal: SignalEnvelope) {
         Log.d(logTag, "handleAnswer from=${signal.from}")
-        connectTimeoutJob?.cancel()
         signal.deviceClass?.let { dropInManager.prepareForCall(it) }
         val description = SessionDescription(SessionDescription.Type.ANSWER, signal.sdp.orEmpty())
-        dropInManager.setRemoteDescription(description)
-        val peer = _uiState.value.selectedPeer
-        if (peer != null) {
-            onCallConnected(peer)
-        } else {
+        dropInManager.setRemoteDescription(
+            description = description,
+            onFailure = { error -> failPendingCall("Could not negotiate call: $error") },
+        ) {
+            val peer = _uiState.value.selectedPeer
             _uiState.value = _uiState.value.copy(
-                isInCall = true,
-                hasRemoteVideo = false,
-                status = "Call established",
+                status = peer?.let { "Connecting to ${it.displayName}" } ?: "Connecting call",
             )
         }
     }
@@ -524,9 +518,8 @@ class DropInViewModel(
         connectTimeoutJob?.cancel()
         stopCallTimer()
         stopQualityPolling()
-        signalingClient.disconnect()
+        signalingClient.close()
         dropInManager.release()
-        super.onCleared()
     }
 
     private fun handleSignalingStatus(status: PeerSignalingStatus) {
@@ -555,112 +548,39 @@ class DropInViewModel(
         }
     }
 
-    private fun IceCandidate.toSignalEnvelope(target: String) = SignalEnvelope(
-        type = SignalType.ICE,
-        from = deviceName,
-        to = target,
-        candidate = IceCandidatePayload(
-            sdpMid = sdpMid,
-            sdpMLineIndex = sdpMLineIndex,
-            sdpCandidate = sdp,
-        ),
-    )
-
-    private fun SessionDescription.Type.canonicalForm(): String = when (this) {
-        SessionDescription.Type.OFFER -> "offer"
-        SessionDescription.Type.ANSWER -> "answer"
-        SessionDescription.Type.PRANSWER -> "pranswer"
-        SessionDescription.Type.ROLLBACK -> "rollback"
-    }
-
     private fun ensureLocalMediaReady() {
         dropInManager.startLocalMedia()
+    }
+
+    private fun failPendingCall(message: String) {
+        Log.w(logTag, message)
+        signalingClient.disconnect()
+        dropInManager.endCall()
+        connectedPeerServiceName = null
+        connectTimeoutJob?.cancel()
+        stopCallTimer()
+        stopQualityPolling()
+        _callMetrics.value = CallMetrics()
+        _uiState.value = _uiState.value.copy(
+            selectedPeer = null,
+            isInCall = false,
+            hasRemoteVideo = false,
+            status = message,
+        )
+    }
+
+    private fun startConnectTimeout(peer: PeerDevice) {
+        connectTimeoutJob?.cancel()
+        connectTimeoutJob = viewModelScope.launch {
+            delay(CONNECTION_TIMEOUT_MS)
+            if (!_uiState.value.isInCall && _uiState.value.selectedPeer?.serviceName == peer.serviceName) {
+                failPendingCall("Could not connect to ${peer.displayName}")
+            }
+        }
     }
 
     private companion object {
         // Tailnet routes may need time to establish a DERP path and complete ICE negotiation.
         const val CONNECTION_TIMEOUT_MS = 25_000L
-    }
-}
-
-class RecentPeersStore(
-    private val preferences: android.content.SharedPreferences,
-    private val json: Json = Json { ignoreUnknownKeys = true },
-) {
-    fun save(peers: List<PeerDevice>) {
-        val encoded = json.encodeToString(
-            ListSerializer(RecentPeer.serializer()),
-            peers.take(MAX_RECENTS).map(RecentPeer::fromPeerDevice),
-        )
-        preferences.edit().putString(KEY_RECENTS, encoded).apply()
-    }
-
-    fun load(): List<PeerDevice> {
-        val raw = preferences.getString(KEY_RECENTS, "").orEmpty()
-        if (raw.isBlank()) return emptyList()
-        return runCatching {
-            json.decodeFromString(ListSerializer(RecentPeer.serializer()), raw)
-                .map { it.toPeerDevice() }
-        }.getOrElse {
-            loadLegacyDelimited(raw)
-        }.deduped().take(MAX_RECENTS)
-    }
-
-    private fun loadLegacyDelimited(raw: String): List<PeerDevice> =
-        raw.split("|").mapNotNull { entry ->
-            val parts = entry.split(";;")
-            if (parts.size == 4) {
-                PeerDevice(
-                    serviceName = parts[0],
-                    displayName = parts[1],
-                    host = parts[2],
-                    port = parts[3].toIntOrNull() ?: DEFAULT_SIGNALING_PORT,
-                )
-            } else {
-                null
-            }
-        }
-
-    private fun List<PeerDevice>.deduped(): List<PeerDevice> =
-        distinctBy { peer ->
-            val normalizedHost = peer.host.trim().lowercase()
-            if (normalizedHost.isNotBlank()) {
-                "host:$normalizedHost:${peer.port}"
-            } else {
-                "service:${peer.serviceName.trim().lowercase()}"
-            }
-        }
-
-    @Serializable
-    private data class RecentPeer(
-        val serviceName: String,
-        val displayName: String,
-        val host: String,
-        val port: Int,
-        val deviceClass: String = "standard",
-    ) {
-        fun toPeerDevice(): PeerDevice = PeerDevice(
-            serviceName = serviceName,
-            displayName = displayName,
-            host = host,
-            port = port,
-            deviceClass = deviceClass,
-        )
-
-        companion object {
-            fun fromPeerDevice(peer: PeerDevice): RecentPeer = RecentPeer(
-                serviceName = peer.serviceName,
-                displayName = peer.displayName,
-                host = peer.host,
-                port = peer.port,
-                deviceClass = peer.deviceClass,
-            )
-        }
-    }
-
-    private companion object {
-        const val KEY_RECENTS = "recents"
-        const val MAX_RECENTS = 5
-        const val DEFAULT_SIGNALING_PORT = 8989
     }
 }

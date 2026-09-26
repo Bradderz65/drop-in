@@ -25,6 +25,8 @@ object DeviceCapability {
 
     fun localDeviceClass(context: Context): String =
         if (isLimitedDevice(context)) CLASS_LIMITED else CLASS_STANDARD
+
+    fun shouldLockLandscape(context: Context): Boolean = isLimitedDevice(context)
 }
 
 fun PeerDevice.effectiveDeviceClass(): String {
