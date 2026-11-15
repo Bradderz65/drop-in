@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.webrtc.IceCandidate
 import org.webrtc.SessionDescription
+import java.net.NetworkInterface
 
 // ── Connection quality buckets ───────────────────────────────
 enum class ConnectionQuality { EXCELLENT, GOOD, FAIR, POOR, UNKNOWN }
@@ -45,6 +46,10 @@ data class DropInUiState(
     val hasRemoteVideo: Boolean = false,
     val status: String = "Searching for local devices",
     val recentPeers: List<PeerDevice> = emptyList(),
+    /** One entry per callable device, merged from [devices] and [recentPeers]. */
+    val contacts: List<PeerDevice> = emptyList(),
+    /** Someone is calling and waiting for Answer or Decline. */
+    val incomingCall: PeerDevice? = null,
     val isRefreshing: Boolean = false,
 )
 
@@ -60,6 +65,19 @@ class DropInViewModel(
     private var callTimerJob: Job? = null
     private var qualityPollingJob: Job? = null
     private var connectedPeerServiceName: String? = null
+    // Signals reach us over two paths (our outgoing socket and our local server), so the
+    // same ANSWER normally arrives twice; only the first may be applied.
+    private var remoteAnswerApplied = false
+    private var contacts: List<Contact> = emptyList()
+    // Other addresses for the device being dialled, tried in order if the current one fails.
+    private var fallbackRoutes: List<PeerDevice> = emptyList()
+    private var isOutgoingCall = false
+    // An incoming call that is ringing and has not been answered or declined yet.
+    private var pendingIncomingOffer: SignalEnvelope? = null
+    private var pendingIncomingPeer: PeerDevice? = null
+    private val pendingIceCandidates = mutableListOf<IceCandidate>()
+    private var ringTimeoutJob: Job? = null
+    private val ringer = IncomingRinger(application)
 
     private val recentPrefs = application.getSharedPreferences("dropin_recents", Context.MODE_PRIVATE)
     private val recentsStore = RecentPeersStore(recentPrefs)
@@ -76,6 +94,7 @@ class DropInViewModel(
     val callMetrics: StateFlow<CallMetrics> = _callMetrics.asStateFlow()
 
     init {
+        refreshContacts()
         runtime.start()
         dropInManager.onRemoteVideoReady = {
             _uiState.value = _uiState.value.copy(hasRemoteVideo = true)
@@ -101,6 +120,7 @@ class DropInViewModel(
         viewModelScope.launch {
             runtime.peers.collect { devices ->
                 _uiState.value = _uiState.value.copy(devices = devices)
+                refreshContacts()
             }
         }
 
@@ -153,14 +173,44 @@ class DropInViewModel(
             media.hasVideo -> "Ready for drop in; no local microphone"
             else -> "Ready to receive; camera and microphone unavailable"
         }
+        // The activity calls this on every resume, including mid-call; the idle status must not
+        // replace "Connecting to…" / "Connected to…" while a call is in progress.
+        val callInProgress = _uiState.value.selectedPeer != null
         _uiState.value = _uiState.value.copy(
             isMicOn = media.isAudioEnabled,
             isCameraOn = media.isVideoEnabled,
-            status = availability,
+            status = if (callInProgress) _uiState.value.status else availability,
         )
     }
 
+    /** Calls a device from the list, trying each known address for it until one answers. */
     fun connectToPeer(peer: PeerDevice) {
+        val routes = routesFor(peer)
+        fallbackRoutes = routes.drop(1)
+        dial(routes.first().copy(displayName = peer.displayName))
+    }
+
+    private fun routesFor(peer: PeerDevice): List<PeerDevice> {
+        val contact = contacts.firstOrNull { contact ->
+            contact.routes.any { it.host == peer.host && it.port == peer.port && it.serviceName == peer.serviceName }
+        } ?: return listOf(peer)
+        // Start from the address the user tapped, then the rest in preference order.
+        val tapped = contact.routes.first { it.host == peer.host && it.port == peer.port && it.serviceName == peer.serviceName }
+        return listOf(tapped) + contact.routes.filterNot { it === tapped }
+    }
+
+    /** Moves to the next address for the device being dialled. False when none are left. */
+    private fun tryNextRoute(reason: String): Boolean {
+        val current = _uiState.value.selectedPeer ?: return false
+        if (_uiState.value.isInCall) return false
+        val next = fallbackRoutes.firstOrNull() ?: return false
+        fallbackRoutes = fallbackRoutes.drop(1)
+        Log.w(logTag, "route ${current.host}:${current.port} failed ($reason); trying ${next.host}:${next.port}")
+        dial(next.copy(displayName = current.displayName))
+        return true
+    }
+
+    private fun dial(peer: PeerDevice) {
         Log.d(logTag, "connectToPeer peer=${peer.displayName} host=${peer.host}:${peer.port}")
         if (peer.host.isBlank() || peer.port !in 1..65535) {
             _uiState.value = _uiState.value.copy(
@@ -170,6 +220,8 @@ class DropInViewModel(
             return
         }
         connectedPeerServiceName = null
+        remoteAnswerApplied = false
+        isOutgoingCall = true
         dropInManager.endCall()
         signalingClient.disconnect()
         dropInManager.prepareForCall(peer.effectiveDeviceClass())
@@ -335,9 +387,28 @@ class DropInViewModel(
         val trimmed = current.dedupedRecentPeers().take(5)
         _uiState.value = _uiState.value.copy(recentPeers = trimmed)
         recentsStore.save(trimmed)
+        refreshContacts()
     }
 
-    private fun loadRecentPeers(): List<PeerDevice> = recentsStore.load()
+    private fun refreshContacts() {
+        val state = _uiState.value
+        contacts = buildContacts(discovered = state.devices, recents = state.recentPeers)
+        _uiState.value = state.copy(contacts = contacts.map { it.primary })
+    }
+
+    // A device can end up in its own recents (e.g. after answering a call routed back through a
+    // registry); offering to call yourself is never useful.
+    private fun loadRecentPeers(): List<PeerDevice> {
+        val ownAddresses = localAddresses()
+        return recentsStore.load().filterNot { it.host.trim() in ownAddresses }
+    }
+
+    private fun localAddresses(): Set<String> = runCatching {
+        NetworkInterface.getNetworkInterfaces().asSequence()
+            .flatMap { it.inetAddresses.asSequence() }
+            .mapNotNull { it.hostAddress?.substringBefore('%') }
+            .toSet()
+    }.getOrDefault(emptySet())
 
     private fun List<PeerDevice>.dedupedRecentPeers(): List<PeerDevice> =
         distinctBy { it.recentIdentityKey() }
@@ -368,9 +439,6 @@ class DropInViewModel(
         return base.stripTransientSuffix()
     }
 
-    private fun String.stripTransientSuffix(): String =
-        replace(Regex("-[0-9a-fA-F]{4}$"), "")
-
     // ── Called when a call is established ─────────────────────
     private fun onCallConnected(peer: PeerDevice) {
         if (connectedPeerServiceName == peer.serviceName && _uiState.value.isInCall) return
@@ -389,12 +457,28 @@ class DropInViewModel(
             Log.w(logTag, "ignoring invalid signal type=${signal.type} from=${signal.from}")
             return
         }
-        if (signal.to != null && signal.to != deviceName && signal.to != "dropin-tailnet-saved") {
+        if (signal.to != null && signal.to != SAVED_TAILNET_PEER_ID && !isSameDevice(signal.to, deviceName)) {
             Log.d(logTag, "ignoring signal addressed to=${signal.to}")
             return
         }
-        val activePeer = _uiState.value.selectedPeer?.serviceName
-        if (signal.type != SignalType.OFFER && activePeer != null && signal.from != activePeer) {
+        val ringing = pendingIncomingOffer
+        if (signal.type == SignalType.HANGUP && ringing != null) {
+            if (isSameDevice(ringing.from, signal.from)) {
+                // The caller gave up before anyone answered.
+                val name = pendingIncomingPeer?.displayName
+                clearIncomingCall(status = name?.let { "Missed call from $it" } ?: "Ready for drop in")
+            }
+            return
+        }
+        val selectedPeer = _uiState.value.selectedPeer
+        val activePeer = selectedPeer?.serviceName
+        // A saved or remembered peer is dialled by address, so its real id is only learned
+        // from its reply; match on the stable name or the host we dialled instead.
+        val fromActivePeer = activePeer == null ||
+            activePeer == SAVED_TAILNET_PEER_ID ||
+            isSameDevice(signal.from, activePeer) ||
+            (!signal.remoteHost.isNullOrBlank() && signal.remoteHost == selectedPeer.host)
+        if (signal.type != SignalType.OFFER && !fromActivePeer) {
             Log.d(logTag, "ignoring signal from unrelated peer=${signal.from} activePeer=$activePeer")
             return
         }
@@ -403,6 +487,10 @@ class DropInViewModel(
             SignalType.ANSWER -> handleAnswer(signal)
             SignalType.ICE -> handleIce(signal)
             SignalType.HANGUP -> {
+                // A hang-up before the call connected means the other side declined or did
+                // not pick up; say so instead of "Call ended", and do not redial elsewhere.
+                val unanswered = !_uiState.value.isInCall && isOutgoingCall && selectedPeer != null
+                fallbackRoutes = emptyList()
                 signalingClient.disconnect()
                 dropInManager.endCall()
                 connectedPeerServiceName = null
@@ -414,20 +502,87 @@ class DropInViewModel(
                     isSpeakerOn = true,
                     hasRemoteVideo = false,
                     selectedPeer = null,
-                    status = "Call ended",
+                    status = if (unanswered) "${selectedPeer?.displayName} didn't answer" else "Call ended",
                 )
                 _callMetrics.value = CallMetrics()
             }
         }
     }
 
+    /**
+     * An incoming call only rings. Nothing is sent back and the camera and microphone are not
+     * offered to the caller until [answerIncomingCall]; the person at this device decides.
+     */
     private fun handleOffer(signal: SignalEnvelope) {
-        val peer = _uiState.value.devices.firstOrNull { it.serviceName == signal.from } ?: run {
+        val ringing = pendingIncomingOffer
+        if (ringing != null && isSameDevice(ringing.from, signal.from)) {
+            // The same caller re-sent its offer (e.g. after trying another address).
+            pendingIncomingOffer = signal
+            return
+        }
+        if (ringing != null || _uiState.value.selectedPeer != null) {
+            Log.d(logTag, "busy; declining offer from=${signal.from}")
+            runtime.sendLocal(SignalEnvelope(type = SignalType.HANGUP, from = deviceName, to = signal.from))
+            return
+        }
+        val peer = resolveIncomingPeer(signal)
+        Log.d(logTag, "incoming call ringing from=${peer.displayName}")
+        pendingIncomingOffer = signal
+        pendingIncomingPeer = peer
+        pendingIceCandidates.clear()
+        _uiState.value = _uiState.value.copy(
+            incomingCall = peer,
+            status = "${peer.displayName} is calling",
+        )
+        ringer.start()
+        ringTimeoutJob?.cancel()
+        ringTimeoutJob = viewModelScope.launch {
+            delay(RING_TIMEOUT_MS)
+            if (pendingIncomingOffer != null) {
+                Log.d(logTag, "incoming call from=${peer.displayName} not answered")
+                runtime.sendLocal(SignalEnvelope(type = SignalType.HANGUP, from = deviceName, to = signal.from))
+                clearIncomingCall(status = "Missed call from ${peer.displayName}")
+            }
+        }
+    }
+
+    fun answerIncomingCall() {
+        val signal = pendingIncomingOffer ?: return
+        val peer = pendingIncomingPeer ?: return
+        val bufferedCandidates = pendingIceCandidates.toList()
+        clearIncomingCall(status = null)
+        acceptOffer(signal, peer, bufferedCandidates)
+    }
+
+    fun declineIncomingCall() {
+        val signal = pendingIncomingOffer ?: return
+        Log.d(logTag, "incoming call declined from=${signal.from}")
+        runtime.sendLocal(SignalEnvelope(type = SignalType.HANGUP, from = deviceName, to = signal.from))
+        clearIncomingCall(status = "Ready for drop in")
+    }
+
+    private fun clearIncomingCall(status: String?) {
+        ringer.stop()
+        ringTimeoutJob?.cancel()
+        ringTimeoutJob = null
+        pendingIncomingOffer = null
+        pendingIncomingPeer = null
+        pendingIceCandidates.clear()
+        _uiState.value = _uiState.value.copy(
+            incomingCall = null,
+            status = status ?: _uiState.value.status,
+        )
+    }
+
+    private fun resolveIncomingPeer(signal: SignalEnvelope): PeerDevice {
+        val knownPeer = _uiState.value.devices.firstOrNull { it.serviceName == signal.from } ?: run {
             val tailnetHost = runtime.savedTailnetHost.value.trim()
             val isTailnetTarget = signal.to == "dropin-tailnet-saved"
+            // The address the offer actually came from is the one that is known to work; our
+            // own saved tailnet host may point at a different device entirely.
             val fallbackHost = when {
-                isTailnetTarget && tailnetHost.isNotBlank() -> tailnetHost
                 !signal.remoteHost.isNullOrBlank() -> signal.remoteHost
+                isTailnetTarget && tailnetHost.isNotBlank() -> tailnetHost
                 else -> _uiState.value.selectedPeer?.host
             }.orEmpty()
 
@@ -445,12 +600,19 @@ class DropInViewModel(
                 )
             }
         }
+        // Show "Brad's phone", not "Brad's phone-52da".
+        return knownPeer.copy(displayName = knownPeer.displayName.stripTransientSuffix())
+    }
+
+    private fun acceptOffer(signal: SignalEnvelope, peer: PeerDevice, bufferedCandidates: List<IceCandidate>) {
         Log.d(logTag, "handleOffer peer=${peer.displayName}")
+        fallbackRoutes = emptyList()
+        isOutgoingCall = false
         connectedPeerServiceName = null
         _uiState.value = _uiState.value.copy(
             selectedPeer = peer,
             hasRemoteVideo = false,
-            status = "Incoming drop in from ${peer.displayName}",
+            status = "Connecting to ${peer.displayName}",
         )
 
         dropInManager.endCall()
@@ -473,6 +635,8 @@ class DropInViewModel(
             description = remoteOffer,
             onFailure = { error -> failPendingCall("Could not accept call: $error") },
         ) {
+            // Candidates that arrived while the call was still ringing.
+            bufferedCandidates.forEach(dropInManager::addIceCandidate)
             dropInManager.createAnswer(
                 onFailure = { error -> failPendingCall("Could not answer call: $error") },
             ) { answer ->
@@ -492,6 +656,11 @@ class DropInViewModel(
     }
 
     private fun handleAnswer(signal: SignalEnvelope) {
+        if (remoteAnswerApplied) {
+            Log.d(logTag, "ignoring duplicate answer from=${signal.from}")
+            return
+        }
+        remoteAnswerApplied = true
         Log.d(logTag, "handleAnswer from=${signal.from}")
         signal.deviceClass?.let { dropInManager.prepareForCall(it) }
         val description = SessionDescription(SessionDescription.Type.ANSWER, signal.sdp.orEmpty())
@@ -508,13 +677,19 @@ class DropInViewModel(
 
     private fun handleIce(signal: SignalEnvelope) {
         Log.d(logTag, "handleIce from=${signal.from}")
-        val candidate = signal.candidate ?: return
-        dropInManager.addIceCandidate(
-            IceCandidate(candidate.sdpMid, candidate.sdpMLineIndex, candidate.sdpCandidate),
-        )
+        val payload = signal.candidate ?: return
+        val candidate = IceCandidate(payload.sdpMid, payload.sdpMLineIndex, payload.sdpCandidate)
+        if (pendingIncomingOffer != null) {
+            // Still ringing: there is no connection to add this to until the call is answered.
+            pendingIceCandidates.add(candidate)
+            return
+        }
+        dropInManager.addIceCandidate(candidate)
     }
 
     override fun onCleared() {
+        ringer.stop()
+        ringTimeoutJob?.cancel()
         connectTimeoutJob?.cancel()
         stopCallTimer()
         stopQualityPolling()
@@ -529,19 +704,31 @@ class DropInViewModel(
             }
             PeerSignalingStatus.Connected -> {
                 Log.d(logTag, "signaling status connected")
+                val peer = _uiState.value.selectedPeer
+                if (isOutgoingCall && peer != null && !_uiState.value.isInCall) {
+                    // We reached the device, so it is now ringing there. Wait as long as it
+                    // rings rather than giving up on the short "is this address alive" timer.
+                    fallbackRoutes = emptyList()
+                    _uiState.value = _uiState.value.copy(status = "Ringing ${peer.displayName}…")
+                    startConnectTimeout(peer, CALLER_RING_TIMEOUT_MS)
+                }
             }
             is PeerSignalingStatus.Closed -> {
                 Log.d(logTag, "signaling status closed code=${status.code} reason=${status.reason}")
             }
             is PeerSignalingStatus.Failed -> {
                 Log.w(logTag, "signaling status failed message=${status.message}")
+                if (tryNextRoute("signaling failed")) return
                 if (!_uiState.value.isInCall) {
                     connectTimeoutJob?.cancel()
                     dropInManager.endCall()
+                    // The technical cause is in the log; on screen it only needs to say what
+                    // happened and what to do.
+                    val name = _uiState.value.selectedPeer?.displayName
                     _uiState.value = _uiState.value.copy(
                         selectedPeer = null,
                         hasRemoteVideo = false,
-                        status = "Signaling failed: ${status.message}",
+                        status = if (name != null) "Couldn't reach $name. Try again in a moment." else "Ready for drop in",
                     )
                 }
             }
@@ -569,17 +756,33 @@ class DropInViewModel(
         )
     }
 
-    private fun startConnectTimeout(peer: PeerDevice) {
+    private fun startConnectTimeout(peer: PeerDevice, timeoutMs: Long? = null) {
         connectTimeoutJob?.cancel()
         connectTimeoutJob = viewModelScope.launch {
-            delay(CONNECTION_TIMEOUT_MS)
+            // With another address still to try, give up on this one sooner.
+            delay(timeoutMs ?: if (fallbackRoutes.isEmpty()) CONNECTION_TIMEOUT_MS else ROUTE_ATTEMPT_TIMEOUT_MS)
             if (!_uiState.value.isInCall && _uiState.value.selectedPeer?.serviceName == peer.serviceName) {
-                failPendingCall("Could not connect to ${peer.displayName}")
+                if (tryNextRoute("no answer")) return@launch
+                if (timeoutMs != null) {
+                    // It rang and nobody picked up; tell the other device to stop ringing.
+                    signalingClient.send(SignalEnvelope(type = SignalType.HANGUP, from = deviceName, to = peer.serviceName))
+                    failPendingCall("${peer.displayName} didn't answer")
+                } else {
+                    failPendingCall("Could not reach ${peer.displayName}")
+                }
             }
         }
     }
 
+    private fun isSameDevice(first: String, second: String): Boolean =
+        first == second || first.stableDeviceId() == second.stableDeviceId()
+
     private companion object {
+        const val ROUTE_ATTEMPT_TIMEOUT_MS = 10_000L
+        // How long an unanswered call rings. The caller waits slightly longer than the
+        // ringing device so the "missed call" is decided in one place.
+        const val RING_TIMEOUT_MS = 45_000L
+        const val CALLER_RING_TIMEOUT_MS = 50_000L
         // Tailnet routes may need time to establish a DERP path and complete ICE negotiation.
         const val CONNECTION_TIMEOUT_MS = 25_000L
     }

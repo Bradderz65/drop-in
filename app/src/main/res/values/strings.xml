@@ -5,5 +5,5 @@
     <string name="notification_service_title">Drop In is ready</string>
     <string name="notification_service_text">Listening for local drop-ins in the background.</string>
     <string name="notification_incoming_title">Incoming drop-in</string>
-    <string name="notification_incoming_text">%1$s is trying to connect.</string>
+    <string name="notification_incoming_text">%1$s is calling. Tap to answer or decline.</string>
 </resources>

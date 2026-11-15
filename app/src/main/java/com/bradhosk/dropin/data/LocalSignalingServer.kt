@@ -20,6 +20,7 @@ class LocalSignalingServer(
     private val _events = MutableSharedFlow<SignalEnvelope>(extraBufferCapacity = 32)
     private val sockets = ConcurrentHashMap.newKeySet<SignalingSocket>()
     private val socketsByPeer = ConcurrentHashMap<String, SignalingSocket>()
+    private val sendExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     @Volatile
     private var identityProvider: (() -> TailnetPeerIdentity)? = null
     private var server: SignalingWsd? = null
@@ -79,12 +80,17 @@ class LocalSignalingServer(
             Log.w(logTag, "local signaling no websocket recipients for type=${message.type} to=${message.to}")
             return
         }
-        recipients.forEach { socket ->
-            runCatching { socket.send(encoded) }
-                .onFailure {
-                    Log.w(logTag, "local signaling send failed", it)
-                    removeSocket(socket)
-                }
+        // Socket writes are network I/O. Callers include button presses on the main thread,
+        // where a direct write throws NetworkOnMainThreadException and the message (a decline
+        // or hang-up) is silently lost. One thread keeps messages in order.
+        sendExecutor.execute {
+            recipients.forEach { socket ->
+                runCatching { socket.send(encoded) }
+                    .onFailure {
+                        Log.w(logTag, "local signaling send failed", it)
+                        removeSocket(socket)
+                    }
+            }
         }
     }
 

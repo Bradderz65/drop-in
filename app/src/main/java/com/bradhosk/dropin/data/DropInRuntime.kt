@@ -28,7 +28,9 @@ class DropInRuntime private constructor(
     private val appContext = context.applicationContext
     private val preferences = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val localServiceName = "dropin-${android.os.Build.MODEL}-${UUID.randomUUID().toString().take(4)}"
+    // The suffix is persisted so this device keeps one identity across restarts; peers that
+    // remember it (recents, in-flight calls) would otherwise stop recognising it.
+    private val localServiceName = "dropin-${android.os.Build.MODEL}-${stableDeviceSuffix()}"
     private val signalingServer = LocalSignalingServer()
     private val peerDiscovery = NsdPeerDiscovery(appContext, localServiceName)
     private val tailnetRegistry = TailnetRegistryDiscovery(scope)
@@ -166,6 +168,15 @@ class DropInRuntime private constructor(
         )
     }
 
+    private fun stableDeviceSuffix(): String {
+        preferences.getString(KEY_DEVICE_SUFFIX, null)
+            ?.takeIf { it.matches(Regex("[0-9a-f]{4}")) }
+            ?.let { return it }
+        return UUID.randomUUID().toString().take(4).also { created ->
+            preferences.edit { putString(KEY_DEVICE_SUFFIX, created) }
+        }
+    }
+
     private fun resolveAdvertisedHost(): String =
         TailscaleAddresses.primary().orEmpty()
 
@@ -173,6 +184,7 @@ class DropInRuntime private constructor(
         private const val PREFS_NAME = "dropin_runtime"
         private const val KEY_SAVED_TAILNET_HOST = "saved_tailnet_host"
         private const val KEY_TAILNET_REGISTRY_URL = "tailnet_registry_url"
+        private const val KEY_DEVICE_SUFFIX = "device_suffix"
         @Volatile
         private var instance: DropInRuntime? = null
 

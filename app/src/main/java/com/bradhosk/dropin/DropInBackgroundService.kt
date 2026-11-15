@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
@@ -18,6 +19,7 @@ import com.bradhosk.dropin.data.PeerSignalingClient
 import com.bradhosk.dropin.data.SignalEnvelope
 import com.bradhosk.dropin.data.SignalType
 import com.bradhosk.dropin.data.toSignalEnvelope
+import com.bradhosk.dropin.ui.stripTransientSuffix
 import com.bradhosk.dropin.webrtc.DropInManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +39,8 @@ class DropInBackgroundService : Service() {
     private val signalingClient = PeerSignalingClient()
     private var activePeerServiceName: String? = null
     private var isAnsweringOffer = false
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -45,6 +49,7 @@ class DropInBackgroundService : Service() {
             stopSelf()
             return
         }
+        acquireNetworkLocks()
 
         runtime = DropInRuntime.getInstance(this)
         runtime.start()
@@ -52,18 +57,29 @@ class DropInBackgroundService : Service() {
         serviceScope.launch {
             runtime.incomingOffers.collect { offer ->
                 Log.d(logTag, "background wake for incoming offer from=${offer.from}")
+                if (isAppVisible()) {
+                    // The open screen already shows the call; a heads-up banner would cover it.
+                    Log.d(logTag, "incoming offer while app visible; skip wake/open")
+                    return@collect
+                }
                 val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 notificationManager.notify(
                     INCOMING_NOTIFICATION_ID,
                     buildIncomingCallNotification(
                         title = getString(R.string.notification_incoming_title),
-                        text = getString(R.string.notification_incoming_text, offer.from.removePrefix("dropin-")),
+                        text = getString(
+                            R.string.notification_incoming_text,
+                            offer.from.removePrefix("dropin-").stripTransientSuffix(),
+                        ),
                     ),
                 )
-                if (!isAppVisible()) {
-                    wakeAndOpenApp()
-                } else {
-                    Log.d(logTag, "incoming offer while app visible; skip wake/open")
+                wakeAndOpenApp()
+                // The banner's job is to get the screen open. The foreground UI can consume the
+                // offer before this notification is even posted, so the usual cancel-on-consume
+                // misses it and "trying to connect" would sit over a call that is already live.
+                serviceScope.launch {
+                    delay(INCOMING_BANNER_LINGER_MS)
+                    if (isAppVisible()) notificationManager.cancel(INCOMING_NOTIFICATION_ID)
                 }
             }
         }
@@ -76,14 +92,12 @@ class DropInBackgroundService : Service() {
                     notificationManager.notify(NOTIFICATION_ID, buildServiceNotification())
                     return@collectLatest
                 }
-                delay(AUTO_ANSWER_UI_GRACE_MS)
-                if (runtime.pendingOffer.value != offer) return@collectLatest
-                if (isAppVisible()) {
-                    Log.d(logTag, "pending offer while app visible; foreground UI will answer")
-                    return@collectLatest
-                }
-                runtime.consumePendingOffer()
-                answerOfferInBackground(offer)
+                // Never answer from here. A call only connects when someone presses Answer on
+                // the incoming-call screen; with the app hidden this service used to accept the
+                // call itself, turning on the camera and microphone with nothing on screen. The
+                // offer stays pending until the activity opens and shows the Answer/Decline
+                // choice.
+                Log.d(logTag, "pending offer from=${offer.from}; waiting for the call screen")
             }
         }
 
@@ -113,7 +127,9 @@ class DropInBackgroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(logTag, "background service onStartCommand flags=$flags startId=$startId")
         enterForeground()
-        return START_NOT_STICKY
+        // Sticky so Android restarts the listener after killing it for memory; an unattended
+        // device must stay reachable without anyone reopening the app.
+        return START_STICKY
     }
 
     override fun onDestroy() {
@@ -126,7 +142,39 @@ class DropInBackgroundService : Service() {
         if (::runtime.isInitialized) {
             runtime.stop()
         }
+        releaseNetworkLocks()
         super.onDestroy()
+    }
+
+    /**
+     * An idle device's Wi-Fi radio drops into power save and misses the broadcast frames (ARP,
+     * mDNS) a caller needs to find it, so it looks offline until something wakes it. Holding
+     * these locks keeps a listening device reachable with its screen off.
+     */
+    private fun acquireNetworkLocks() {
+        runCatching {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "$packageName:listen")
+                .apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            multicastLock = wifiManager.createMulticastLock("$packageName:discovery").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.d(logTag, "wifi and multicast locks acquired")
+        }.onFailure { error ->
+            Log.w(logTag, "could not acquire wifi locks", error)
+        }
+    }
+
+    private fun releaseNetworkLocks() {
+        runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
+        runCatching { multicastLock?.takeIf { it.isHeld }?.release() }
+        wifiLock = null
+        multicastLock = null
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -332,6 +380,7 @@ class DropInBackgroundService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val INCOMING_NOTIFICATION_ID = 1002
         private const val AUTO_ANSWER_UI_GRACE_MS = 300L
+        private const val INCOMING_BANNER_LINGER_MS = 2_500L
         private const val WAKE_LOCK_TIMEOUT_MS = 10_000L
 
         fun start(context: Context) {

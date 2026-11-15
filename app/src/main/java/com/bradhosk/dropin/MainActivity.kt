@@ -25,10 +25,12 @@ import androidx.core.graphics.toColorInt
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.bradhosk.dropin.ui.CallProgressOverlay
 import com.bradhosk.dropin.ui.CallVideoHost
 import com.bradhosk.dropin.ui.DropInScreen
 import com.bradhosk.dropin.ui.DropInTheme
 import com.bradhosk.dropin.ui.DropInViewModel
+import com.bradhosk.dropin.ui.IncomingCallOverlay
 
 class MainActivity : ComponentActivity() {
     companion object {
@@ -107,6 +109,21 @@ class MainActivity : ComponentActivity() {
                     localVideo = { modifier -> videoHost.Local(modifier) },
                     remoteVideo = { modifier -> videoHost.Remote(modifier) },
                 )
+                val connectingPeer = state.selectedPeer
+                if (connectingPeer != null && !state.isInCall && state.incomingCall == null) {
+                    CallProgressOverlay(
+                        peer = connectingPeer,
+                        status = state.status,
+                        onCancel = { viewModel.hangUp() },
+                    )
+                }
+                state.incomingCall?.let { caller ->
+                    IncomingCallOverlay(
+                        caller = caller,
+                        onAnswer = viewModel::answerIncomingCall,
+                        onDecline = viewModel::declineIncomingCall,
+                    )
+                }
             }
         }
     }

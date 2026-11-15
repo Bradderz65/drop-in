@@ -37,6 +37,9 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Lets the background service bring the call screen forward on an unattended device;
+         without it Android blocks the activity start and the call runs with nothing on screen. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <queries>
         <package android:name="io.homeassistant.companion.android" />

@@ -39,6 +39,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CallEnd
 import androidx.compose.material.icons.rounded.Cameraswitch
 import androidx.compose.material.icons.rounded.Check
@@ -213,7 +214,10 @@ fun DropInScreen(
     val context = LocalContext.current
     val wideLayout = isWideLayout()
     val lockLandscape = remember(context) { DeviceCapability.shouldLockLandscape(context) }
-    val pinControls = (lockLandscape || wideLayout) && !(isFullscreen && state.isInCall)
+    // Controls only auto-hide over fullscreen video. Outside fullscreen they stay put on every
+    // layout: when they vanished the list below slid up, so a tap aimed at "hang up" hit
+    // whatever had moved into its place.
+    val pinControls = !(isFullscreen && state.isInCall)
 
     LaunchedEffect(state.savedTailnetHost) { tailnetHostDraft = state.savedTailnetHost }
     LaunchedEffect(state.tailnetRegistryUrl) { tailnetRegistryDraft = state.tailnetRegistryUrl }
@@ -582,22 +586,13 @@ private fun TabletPeersPanel(
                 contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 4.dp, bottom = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                if (state.recentPeers.isNotEmpty() && !state.isInCall) {
-                    item { SectionLabel("Recent", large = true) }
-                    itemsIndexed(
-                        state.recentPeers,
-                        key = { index, peer -> "recent-$index-${peer.serviceName}" },
-                    ) { _, peer ->
-                        PeerRow(peer = peer, large = true, subdued = true, onConnect = { onConnect(peer) })
-                    }
-                }
-                item { SectionLabel("Available", large = true) }
-                if (state.devices.isEmpty()) {
+                // One row per person: no Recent/Available split to choose between.
+                if (state.contacts.isEmpty()) {
                     item { EmptyPeerState(large = true) }
-                } else {
+                } else if (!state.isInCall) {
                     itemsIndexed(
-                        state.devices,
-                        key = { index, peer -> "peer-$index-${peer.serviceName}" },
+                        state.contacts,
+                        key = { index, peer -> "contact-$index-${peer.serviceName}" },
                     ) { _, peer ->
                         PeerRow(peer = peer, large = true, onConnect = { onConnect(peer) })
                     }
@@ -1068,27 +1063,12 @@ private fun PeersPanel(
             contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 12.dp, bottom = bottomPad),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            if (state.recentPeers.isNotEmpty() && !state.isInCall) {
-                item {
-                    SectionLabel("Recent")
-                }
-                itemsIndexed(
-                    state.recentPeers,
-                    key = { index, peer -> "recent-$index-${peer.serviceName}" },
-                ) { _, peer ->
-                    PeerRow(peer = peer, subdued = true, onConnect = { onConnect(peer) })
-                }
-                item { Spacer(modifier = Modifier.height(4.dp)) }
-            }
-
-            item { SectionLabel("Available") }
-
-            if (state.devices.isEmpty()) {
+            if (state.contacts.isEmpty()) {
                 item { EmptyPeerState() }
             } else {
                 itemsIndexed(
-                    state.devices,
-                    key = { index, peer -> "peer-$index-${peer.serviceName}" },
+                    state.contacts,
+                    key = { index, peer -> "contact-$index-${peer.serviceName}" },
                 ) { _, peer ->
                     PeerRow(peer = peer, onConnect = { onConnect(peer) })
                 }
@@ -1712,12 +1692,12 @@ private fun EmptyPeerState(large: Boolean = false) {
             modifier = Modifier.size(36.dp),
         )
         Text(
-            text = "No devices found",
+            text = "Nobody to call yet",
             style = if (large) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.bodyMedium,
             color = C.textSecondary,
         )
         Text(
-            text = "Pull down to refresh",
+            text = "Still looking — people appear here by themselves",
             style = if (large) MaterialTheme.typography.bodyLarge else MaterialTheme.typography.bodySmall,
             color = C.textSecondary.copy(alpha = 0.6f),
         )
@@ -1780,12 +1760,27 @@ private fun PeerRow(
             }
         }
         if (large) {
-            Column(horizontalAlignment = Alignment.End) {
+            // A solid button with a phone icon reads as "press to call" at arm's length; the
+            // old accent-coloured word "Connect" looked like a status label.
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(C.accent)
+                    .padding(horizontal = 18.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Call,
+                    contentDescription = null,
+                    tint = C.background,
+                    modifier = Modifier.size(26.dp),
+                )
                 Text(
-                    text = "Connect",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = C.accent,
-                    fontWeight = FontWeight.SemiBold,
+                    text = "Call",
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = C.background,
+                    fontWeight = FontWeight.Bold,
                 )
             }
         } else {
